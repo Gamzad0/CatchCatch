@@ -1,8 +1,8 @@
-"""PyAutoGUI input and translation between viewport and screen coordinates.
+"""PyAutoGUI input and conversion between viewport and screen coordinates.
 
 Calibration requires the cursor to be at the reference element's CENTER.
-Only translation is supported: CSS pixels and screen units must have the same
-scale. Recalibrate after window movement, browser zoom, DPI/display changes,
+Calibration applies a uniform physical-pixel/CSS-pixel scale and an offset.
+Recalibrate after window movement, browser zoom, DPI/display changes,
 or changes to browser chrome. Keep the intended tab foreground and unobscured.
 Offsets stay in memory; no authentication or browser data is persisted.
 
@@ -16,7 +16,7 @@ Example (caller provides the chosen tab URL and reference selector)::
     if reference is None:
         raise RuntimeError('Reference element is unavailable')
     input('Place cursor at reference center, then press Enter: ')
-    control.calibrate(*reference.center)
+    control.calibrate(*reference.center, scale=reader.device_pixel_ratio())
     input('Place cursor over the target, then press Enter: ')
     target = control.find_clickable_under_cursor(reader)
     if target is not None:
@@ -38,9 +38,11 @@ from browser_reader import BrowserReader, ElementPosition
 class ComputerControl:
     def __init__(self):
         self._offset = None
+        self._scale = 1.0
 
     def clear_calibration(self):
         self._offset = None
+        self._scale = 1.0
 
     @property
     def offset(self):
@@ -48,25 +50,33 @@ class ComputerControl:
             raise RuntimeError('Calibrate coordinates before using mouse input')
         return self._offset
 
-    def calibrate(self, web_x: float, web_y: float):
-        """Call when the user has placed the cursor at the known web point."""
+    @property
+    def scale(self):
+        self.offset  # Require a valid calibration.
+        return self._scale
+
+    def calibrate(self, web_x: float, web_y: float, *, scale: float = 1.0):
+        """Calibrate at a known web point using the browser's pixel ratio."""
         if not math.isfinite(web_x) or not math.isfinite(web_y):
             raise ValueError('Coordinates must be finite')
+        if isinstance(scale, bool) or not math.isfinite(scale) or scale <= 0:
+            raise ValueError('Scale must be finite and positive')
         screen_x, screen_y = pyautogui.position()
-        self._offset = screen_x - web_x, screen_y - web_y
+        self._offset = screen_x - web_x * scale, screen_y - web_y * scale
+        self._scale = scale
         return self._offset
 
     def web_to_screen(self, web_x: float, web_y: float):
         offset_x, offset_y = self.offset
         if not math.isfinite(web_x) or not math.isfinite(web_y):
             raise ValueError('Coordinates must be finite')
-        return web_x + offset_x, web_y + offset_y
+        return web_x * self._scale + offset_x, web_y * self._scale + offset_y
 
     def screen_to_web(self, screen_x: float, screen_y: float):
         offset_x, offset_y = self.offset
         if not math.isfinite(screen_x) or not math.isfinite(screen_y):
             raise ValueError('Coordinates must be finite')
-        return screen_x - offset_x, screen_y - offset_y
+        return (screen_x - offset_x) / self._scale, (screen_y - offset_y) / self._scale
 
     def find_clickable_under_cursor(self, reader: BrowserReader) -> Optional[ElementPosition]:
         """Read cursor, reverse the offset, then ask CDP to hit-test the DOM."""

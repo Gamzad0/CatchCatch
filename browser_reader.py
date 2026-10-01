@@ -159,6 +159,14 @@ class BrowserReader:
             return None
         return ElementPosition(**value)
 
+    def device_pixel_ratio(self) -> float:
+        """Read the physical-pixel/CSS-pixel ratio, including desktop zoom."""
+        value = self._evaluate('window.devicePixelRatio')
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value <= 0):
+            raise BrowserReaderError('Browser returned an invalid devicePixelRatio')
+        return float(value)
+
     def find_clickable(self, selector: str) -> Optional[ElementPosition]:
         """Find a unique selector match, then its closest clickable ancestor.
 

@@ -4,7 +4,7 @@ Launch from the application's coordinate test button. A missing test.html tab
 is opened in dedicated Chrome and its WebSocket URL is discovered automatically.
 Keep the test tab foreground, unobscured, and at the same window position.
 Press Enter using the keyboard without moving the cursor from the requested
-point. CSS pixels and screen coordinates must use the same scale.
+point. Chrome's devicePixelRatio accounts for display scale and desktop zoom.
 
 Required buttons in test.html:
     #reference: the upper-left button labeled '보정 기준'.
@@ -14,6 +14,7 @@ Required buttons in test.html:
 import time
 import argparse
 import json
+import math
 import subprocess
 import pyautogui
 from pathlib import Path
@@ -96,6 +97,12 @@ def wait_for_reference(reader, timeout=10):
     raise RuntimeError("test.html의 '보정 기준' 버튼 (#reference)이 준비되지 않았습니다.")
 
 
+def check_calibration_scale(reader, control):
+    if not math.isclose(reader.device_pixel_ratio(), control.scale, rel_tol=1e-6):
+        control.clear_calibration()
+        raise RuntimeError("보정 이후 화면 배율 또는 Chrome 확대율이 바뀌었습니다. 테스트를 다시 실행하세요.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="로컬 test.html 좌표 변환 테스트")
     parser.add_argument("--cdp-endpoint", required=True,
@@ -120,9 +127,12 @@ def main():
         print("'보정 기준' 버튼의 웹 중심 좌표:", reference.center, "(예상: 200, 140)")
 
         input("왼쪽 위 '보정 기준' 버튼 (#reference)의 사각형 정중앙에 마우스를 놓고 Enter: ")
-        print("오프셋:", control.calibrate(*reference.center))
+        scale = reader.device_pixel_ratio()
+        print("웹→화면 배율 (devicePixelRatio):", scale)
+        print("오프셋:", control.calibrate(*reference.center, scale=scale))
 
         input("오른쪽 아래 '클릭 대상' 버튼 (#target) 안의 글자(span) 위에 마우스를 놓고 Enter: ")
+        check_calibration_scale(reader, control)
         expected = reader.find_clickable("#target")
         if expected is None:
             raise RuntimeError("'클릭 대상' 버튼 (#target)이 보이지 않거나 가려져 있습니다.")
@@ -145,10 +155,12 @@ def main():
         print("'클릭 대상' 버튼의 웹 중심 좌표:", target.center, "(예상: 500, 340)")
         print("자동 이동을 볼 수 있도록 마우스를 버튼 밖의 다른 위치로 옮기세요. 3초 뒤 '클릭 대상' 버튼 중앙으로 이동합니다.", flush=True)
         time.sleep(3)
+        check_calibration_scale(reader, control)
         control.move_to(*target.center)
 
         answer = input("마우스가 '클릭 대상' 버튼 (#target)의 정중앙에 도착했나요? 클릭하려면 y 입력: ")
         if answer.strip().lower() == "y":
+            check_calibration_scale(reader, control)
             fresh_target = reader.find_clickable("#target")
             if fresh_target is None or fresh_target != target:
                 raise RuntimeError("'클릭 대상' 버튼 (#target)의 위치나 상태가 바뀌었습니다. 테스트를 다시 실행하세요.")
