@@ -18,7 +18,7 @@ def launch_coordinate_test(window, connection):
         return
     if (not connection.endpoint or connection.socket.state()
             != QAbstractSocket.SocketState.ConnectedState):
-        window.browser_status.setText("먼저 브라우저를 연결하고 전용 Chrome에서 test.html을 여세요.")
+        window.browser_status.setText("먼저 브라우저를 연결하세요.")
         return
     directory = Path(__file__).resolve().parent
     script = directory / "test_mouse_control.py"
@@ -31,14 +31,16 @@ def launch_coordinate_test(window, connection):
         executable = executable.with_name("python.exe")
     try:
         subprocess.Popen(
-            [str(executable), "-i", str(script), "--cdp-endpoint", connection.endpoint],
+            [str(executable), "-i", str(script), "--cdp-endpoint", connection.endpoint,
+             "--chrome-executable", str(chrome_executable()),
+             "--chrome-profile", str(connection.profile)],
             cwd=str(directory),
             creationflags=subprocess.CREATE_NEW_CONSOLE,
         )
     except OSError as error:
         window.browser_status.setText(f"테스트 콘솔을 실행하지 못했습니다: {error}")
         return
-    window.browser_status.setText("좌표 변환 테스트 콘솔을 열었습니다. 콘솔 안내에 따라 진행하세요.")
+    window.browser_status.setText("테스트 콘솔에서 test.html을 준비합니다. 콘솔 안내에 따라 진행하세요.")
 
 
 def chrome_executable():

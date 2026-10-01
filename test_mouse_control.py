@@ -1,7 +1,7 @@
 """Manual CDP/mouse test against the local test.html page.
 
-Launch from the application's coordinate test button after opening test.html
-in its dedicated Chrome. The tab WebSocket URL is discovered automatically.
+Launch from the application's coordinate test button. A missing test.html tab
+is opened in dedicated Chrome and its WebSocket URL is discovered automatically.
 Keep the test tab foreground, unobscured, and at the same window position.
 Press Enter using the keyboard without moving the cursor from the requested
 point. CSS pixels and screen coordinates must use the same scale.
@@ -14,6 +14,7 @@ Required buttons in test.html:
 import time
 import argparse
 import json
+import subprocess
 from pathlib import Path
 from urllib.error import URLError
 from urllib.parse import urlsplit
@@ -23,6 +24,10 @@ from PySide6.QtCore import QCoreApplication, QUrl
 
 from browser_reader import BrowserReader, BrowserReaderError
 from computer_control import ComputerControl
+
+
+class TestPageNotOpen(RuntimeError):
+    """No matching test tab; opening the local page is permitted."""
 
 
 def find_test_websocket(endpoint):
@@ -43,8 +48,10 @@ def find_test_websocket(endpoint):
     expected = QUrl.fromLocalFile(str(Path(__file__).resolve().with_name("test.html")))
     matches = [tab for tab in tabs if isinstance(tab, dict)
                and tab.get("type") == "page" and QUrl(tab.get("url", "")) == expected]
-    if len(matches) != 1:
-        raise RuntimeError("전용 Chrome에서 이 프로젝트의 test.html 탭을 하나만 열고 다시 실행하세요.")
+    if not matches:
+        raise TestPageNotOpen("전용 Chrome에 테스트 페이지가 열려 있지 않습니다.")
+    if len(matches) > 1:
+        raise RuntimeError("테스트 페이지가 여러 개 열려 있습니다. test.html 탭을 하나만 남기고 다시 실행하세요.")
     websocket = matches[0].get("webSocketDebuggerUrl", "")
     url = urlsplit(websocket)
     if (url.scheme != "ws" or url.hostname != "127.0.0.1"
@@ -54,10 +61,46 @@ def find_test_websocket(endpoint):
     return websocket
 
 
+def prepare_test_page(endpoint, chrome, profile, timeout=10):
+    """Reuse a unique test tab or open it via Chrome's normal launch arguments."""
+    page = Path(__file__).resolve().with_name("test.html")
+    if not page.is_file():
+        raise RuntimeError("프로젝트의 test.html 파일을 찾을 수 없습니다.")
+    try:
+        return find_test_websocket(endpoint)
+    except TestPageNotOpen:
+        pass
+    print("전용 Chrome에서 테스트 페이지를 여는 중입니다…", flush=True)
+    subprocess.Popen([
+        chrome, f"--user-data-dir={profile}",
+        "--new-window", page.as_uri(),
+    ])
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            return find_test_websocket(endpoint)
+        except TestPageNotOpen:
+            time.sleep(0.25)
+    raise RuntimeError("테스트 페이지가 열리지 않았습니다. 전용 Chrome 상태를 확인하고 다시 실행하세요.")
+
+
+def wait_for_reference(reader, timeout=10):
+    """Allow the newly opened page to finish rendering before calibration."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        reference = reader.find_clickable("#reference")
+        if reference is not None:
+            return reference
+        time.sleep(0.25)
+    raise RuntimeError("test.html의 '보정 기준' 버튼 (#reference)이 준비되지 않았습니다.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="로컬 test.html 좌표 변환 테스트")
     parser.add_argument("--cdp-endpoint", required=True,
                         help="앱이 자동으로 전달하는 localhost CDP 주소")
+    parser.add_argument("--chrome-executable", required=True)
+    parser.add_argument("--chrome-profile", required=True)
     args = parser.parse_args()
     app = QCoreApplication([])
     print("Chrome의 test.html 페이지에서 다음 두 버튼을 사용합니다.")
@@ -67,12 +110,12 @@ def main():
     reader = None
 
     try:
-        reader = BrowserReader(find_test_websocket(args.cdp_endpoint))
+        reader = BrowserReader(prepare_test_page(
+            args.cdp_endpoint, args.chrome_executable, args.chrome_profile))
         control = ComputerControl()
         reader.connect()
-        reference = reader.find_clickable("#reference")
-        if reference is None:
-            raise RuntimeError("test.html의 '보정 기준' 버튼 (#reference)을 찾을 수 없습니다.")
+        print("테스트 페이지가 보이도록 Chrome 창을 앞에 두세요.", flush=True)
+        reference = wait_for_reference(reader)
         print("'보정 기준' 버튼의 웹 중심 좌표:", reference.center, "(예상: 200, 140)")
 
         input("왼쪽 위 '보정 기준' 버튼 (#reference)의 사각형 정중앙에 마우스를 놓고 Enter: ")
