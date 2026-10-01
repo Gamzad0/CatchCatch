@@ -11,6 +11,36 @@ from PySide6.QtWidgets import QApplication
 from ui import MainWindow
 
 
+def launch_coordinate_test(window, connection):
+    """Run the existing interactive test in its own Windows console."""
+    if sys.platform != "win32":
+        window.browser_status.setText("좌표 변환 테스트 콘솔은 Windows 환경에서 지원합니다.")
+        return
+    if (not connection.endpoint or connection.socket.state()
+            != QAbstractSocket.SocketState.ConnectedState):
+        window.browser_status.setText("먼저 브라우저를 연결하고 전용 Chrome에서 test.html을 여세요.")
+        return
+    directory = Path(__file__).resolve().parent
+    script = directory / "test_mouse_control.py"
+    if not script.is_file():
+        window.browser_status.setText("test_mouse_control.py 파일을 찾을 수 없습니다.")
+        return
+    # pythonw.exe has no console input/output; use the same environment's python.exe.
+    executable = Path(sys.executable)
+    if executable.name.lower() == "pythonw.exe":
+        executable = executable.with_name("python.exe")
+    try:
+        subprocess.Popen(
+            [str(executable), "-i", str(script), "--cdp-endpoint", connection.endpoint],
+            cwd=str(directory),
+            creationflags=subprocess.CREATE_NEW_CONSOLE,
+        )
+    except OSError as error:
+        window.browser_status.setText(f"테스트 콘솔을 실행하지 못했습니다: {error}")
+        return
+    window.browser_status.setText("좌표 변환 테스트 콘솔을 열었습니다. 콘솔 안내에 따라 진행하세요.")
+
+
 def chrome_executable():
     """Find installed Windows Chrome without asking for internal settings."""
     import winreg
@@ -168,6 +198,7 @@ def main():
     app = QApplication(sys.argv)
     window = MainWindow()
     connection = BrowserConnection(window)
+    window.coordinate_test_button.clicked.connect(lambda: launch_coordinate_test(window, connection))
     app.aboutToQuit.connect(connection.close)
     window.show()
     return app.exec()
