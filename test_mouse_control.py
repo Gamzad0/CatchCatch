@@ -15,6 +15,7 @@ import time
 import argparse
 import json
 import subprocess
+import pyautogui
 from pathlib import Path
 from urllib.error import URLError
 from urllib.parse import urlsplit
@@ -122,11 +123,23 @@ def main():
         print("오프셋:", control.calibrate(*reference.center))
 
         input("오른쪽 아래 '클릭 대상' 버튼 (#target) 안의 글자(span) 위에 마우스를 놓고 Enter: ")
-        target = control.find_clickable_under_cursor(reader)
-        if target is None:
-            raise RuntimeError("현재 마우스 아래에 클릭 가능한 요소가 없습니다.")
         expected = reader.find_clickable("#target")
-        if expected is None or target != expected:
+        if expected is None:
+            raise RuntimeError("'클릭 대상' 버튼 (#target)이 보이지 않거나 가려져 있습니다.")
+        screen_point = pyautogui.position()
+        web_point = control.screen_to_web(*screen_point)
+        print("현재 마우스 화면 좌표:", tuple(screen_point))
+        print("변환된 마우스 웹 좌표:", web_point)
+        print("클릭 대상의 웹 영역:",
+              (expected.x, expected.y, expected.x + expected.width,
+               expected.y + expected.height))
+        print("클릭 대상의 예상 화면 중심:", control.web_to_screen(*expected.center))
+        target = reader.find_clickable_at(*web_point)
+        if target is None:
+            raise RuntimeError(
+                "변환된 마우스 웹 좌표에 클릭 가능한 요소가 없습니다. "
+                "출력된 좌표와 대상 영역, 화면 배율을 확인하세요.")
+        if target != expected:
             raise RuntimeError("마우스 아래 요소가 '클릭 대상' 버튼 (#target)과 일치하지 않습니다.")
         print("탐색 결과:", target)
         print("'클릭 대상' 버튼의 웹 중심 좌표:", target.center, "(예상: 500, 340)")
