@@ -27,6 +27,7 @@ class ElementPosition:
     y: float
     width: float
     height: float
+    label: str = ''
 
     @property
     def center(self):
@@ -34,7 +35,7 @@ class ElementPosition:
 
 
 # DOM observation only: no clicks, scrolling, focus, or page state writes.
-_ELEMENT_POSITION = """
+_ELEMENT_POSITION = r"""
     if (!el) return null;
     if (el.matches('iframe, frame'))
         throw new Error('Frame contents are not supported');
@@ -53,8 +54,19 @@ _ELEMENT_POSITION = """
     const hit = document.elementFromPoint(cx, cy);
     if (!hit || (hit !== clickable && !clickable.contains(hit))) return null;
     if (hit.closest('button, a, input, [role="button"]') !== clickable) return null;
+    const labelledBy = (clickable.getAttribute('aria-labelledby') || '')
+        .split(/\s+/).filter(Boolean)
+        .map(id => document.getElementById(id)?.textContent || '').join(' ');
+    const nearby = [clickable.previousElementSibling, clickable.nextElementSibling]
+        .filter(node => node && !node.matches('button, a, input, [role="button"]'))
+        .map(node => node.textContent || '').find(text => text.trim()) || '';
+    const label = (clickable.getAttribute('aria-label') || labelledBy ||
+        clickable.getAttribute('title') ||
+        (clickable.labels && Array.from(clickable.labels).map(x => x.textContent).join(' ')) ||
+        clickable.innerText || clickable.value ||
+        clickable.closest('label')?.textContent || nearby || '').trim().replace(/\s+/g, ' ');
     return {tag: clickable.tagName.toLowerCase(), x: rect.x, y: rect.y,
-            width: rect.width, height: rect.height};
+            width: rect.width, height: rect.height, label: label.slice(0, 120)};
 """
 
 
@@ -166,6 +178,10 @@ class BrowserReader:
                 or not math.isfinite(value) or value <= 0):
             raise BrowserReaderError('Browser returned an invalid devicePixelRatio')
         return float(value)
+
+    def page_has_focus(self) -> bool:
+        """Whether the selected tab currently owns keyboard focus."""
+        return self._evaluate('document.hasFocus()') is True
 
     def find_clickable(self, selector: str) -> Optional[ElementPosition]:
         """Find a unique selector match, then its closest clickable ancestor.
