@@ -1,10 +1,7 @@
 import sys
 import os
 import subprocess
-import json
 from pathlib import Path
-from urllib.request import ProxyHandler, build_opener
-from urllib.parse import urlsplit
 
 import pyautogui
 
@@ -16,10 +13,11 @@ from PySide6.QtWidgets import QApplication
 from ui import MainWindow
 from browser_reader import BrowserReader, BrowserReaderError
 from computer_control import ComputerControl
+from test_mouse_control import TestPageNotOpen, find_test_websocket
 
 
 class CursorInspector(QObject):
-    """Read the one selected Chrome page and show the hovered button."""
+    """Calibrate on the initial test page, then inspect its current tab."""
 
     def __init__(self, window, connection):
         super().__init__(window)
@@ -29,63 +27,95 @@ class CursorInspector(QObject):
         self.control = ComputerControl()
         self.reference = None
         self.busy = False
+        self.query_failures = 0
+        self.calibration_generation = 0
+        self.page_attempts = 0
+        self.page_poll = QTimer(self)
+        self.page_poll.setInterval(250)
+        self.page_poll.timeout.connect(self._find_test_page)
         self.timer = QTimer(self)
         self.timer.setInterval(350)
         self.timer.timeout.connect(self.update_cursor)
         window.calibrate_button.clicked.connect(self.begin_calibration)
+        connection.socket.connected.connect(self.begin_calibration)
         connection.socket.disconnected.connect(self.close)
-
-    def _single_page_url(self):
-        endpoint = self.connection.endpoint
-        if not endpoint or self.connection.socket.state() != QAbstractSocket.SocketState.ConnectedState:
-            raise RuntimeError("먼저 브라우저를 연결하세요.")
-        address = urlsplit(endpoint)
-        if address.scheme != "http" or address.hostname != "127.0.0.1" or not address.port:
-            raise RuntimeError("Chrome 연결 주소를 확인할 수 없습니다.")
-        opener = build_opener(ProxyHandler({}))
-        with opener.open(f"{endpoint}/json/list", timeout=3) as response:
-            tabs = json.load(response)
-        pages = [tab for tab in tabs if isinstance(tab, dict) and tab.get("type") == "page"
-                 and tab.get("url", "").startswith(("http:", "https:", "file:"))]
-        if len(pages) != 1:
-            raise RuntimeError("전용 Chrome에 웹페이지 탭을 하나만 열고 다시 보정하세요.")
-        websocket = pages[0].get("webSocketDebuggerUrl", "")
-        url = urlsplit(websocket)
-        if (url.scheme != "ws" or url.hostname != "127.0.0.1" or
-                url.port != address.port or not url.path.startswith("/devtools/page/")):
-            raise RuntimeError("웹페이지 탭의 CDP 주소를 확인할 수 없습니다.")
-        return websocket
 
     def begin_calibration(self):
         self.close()
-        selector = self.window.reference_selector.text().strip()
-        if not selector:
-            self.window.cursor_status.setText("보정 기준 버튼의 CSS 선택자를 입력하세요.")
+        if (not self.connection.endpoint or self.connection.socket.state()
+                != QAbstractSocket.SocketState.ConnectedState):
+            self.window.cursor_status.setText("먼저 브라우저를 연결하세요.")
             return
+        self.window.cursor_status.setText("보정 화면을 준비하는 중입니다…")
+        self.page_attempts = 0
+        self._find_test_page()
+
+    def _find_test_page(self):
         try:
-            self.reader = BrowserReader(self._single_page_url(), timeout_ms=1500)
+            websocket = find_test_websocket(self.connection.endpoint)
+        except TestPageNotOpen:
+            if self.page_attempts == 0 and self.connection._existing:
+                page = Path(__file__).resolve().with_name("test.html")
+                if not page.is_file():
+                    self.window.cursor_status.setText("보정 화면 test.html을 찾을 수 없습니다.")
+                    return
+                try:
+                    subprocess.Popen([
+                        str(chrome_executable()),
+                        f"--user-data-dir={self.connection.profile}",
+                        "--new-window", page.as_uri(),
+                    ])
+                except OSError as error:
+                    self.window.cursor_status.setText(f"보정 화면을 열지 못했습니다: {error}")
+                    return
+            self.page_attempts += 1
+            if self.page_attempts >= 40:
+                self.page_poll.stop()
+                self.window.cursor_status.setText("보정 화면이 열리지 않았습니다. 다시 보정을 누르세요.")
+            else:
+                self.page_poll.start()
+            return
+        except (ValueError, RuntimeError, OSError) as error:
+            self.page_poll.stop()
+            self.window.cursor_status.setText(f"보정 화면 탐색 실패: {error}")
+            return
+        self.page_poll.stop()
+        try:
+            self.reader = BrowserReader(websocket, timeout_ms=1500)
             self.reader.connect()
-            self.reference = self.reader.find_clickable(selector)
+            self.reference = self.reader.find_clickable("#reference")
             if self.reference is None:
-                raise RuntimeError("보정 기준 버튼을 찾지 못했습니다.")
-            self.window.cursor_status.setText("3초 안에 Chrome으로 이동해 기준 버튼 중앙에 커서를 놓으세요.")
+                self.reader.close()
+                self.reader = None
+                self.page_attempts += 1
+                if self.page_attempts >= 40:
+                    raise RuntimeError("보정 기준 버튼을 찾지 못했습니다.")
+                self.page_poll.start()
+                return
+            self.window.cursor_status.setText(
+                "5초 안에 Chrome 페이지를 클릭해 활성화하고 '보정 기준' 버튼 중앙에 커서를 놓으세요.")
             self.window.calibrate_button.setEnabled(False)
-            QTimer.singleShot(3000, self.finish_calibration)
+            generation = self.calibration_generation
+            QTimer.singleShot(5000, lambda: self.finish_calibration(generation))
         except (BrowserReaderError, RuntimeError, ValueError, OSError) as error:
             self.close()
             self.window.cursor_status.setText(f"보정 실패: {error}")
 
-    def finish_calibration(self):
+    def finish_calibration(self, generation):
+        if generation != self.calibration_generation:
+            return
         self.window.calibrate_button.setEnabled(True)
         if self.reader is None or self.reference is None:
             return
         try:
             if not self.reader.page_has_focus():
                 raise RuntimeError("Chrome 페이지가 활성화되지 않았습니다.")
-            fresh = self.reader.find_clickable(self.window.reference_selector.text().strip())
+            fresh = self.reader.find_clickable("#reference")
             if fresh != self.reference:
                 raise RuntimeError("기준 버튼 위치가 변경되었습니다.")
             self.control.calibrate(*fresh.center, scale=self.reader.device_pixel_ratio())
+            self.window.browser_status.setText(
+                "보정 완료. 같은 Chrome 탭에서 LMS로 이동하세요. 로그인 후 버튼 위에 커서를 놓으면 이름을 표시합니다.")
             self.timer.start()
             self.update_cursor()
         except (BrowserReaderError, RuntimeError, ValueError, OSError) as error:
@@ -104,19 +134,30 @@ class CursorInspector(QObject):
                 raise RuntimeError("화면 배율이 바뀌었습니다. 다시 보정하세요.")
             x, y = pyautogui.position()
             target = self.reader.find_clickable_at(*self.control.screen_to_web(x, y))
+            self.query_failures = 0
             if target is None:
                 self.window.cursor_status.setText("커서 아래 버튼: 없음")
             else:
                 name = target.label or "이름을 추정할 텍스트 없음"
                 self.window.cursor_status.setText(f"커서 아래 버튼: {name} ({target.tag})")
-        except (BrowserReaderError, RuntimeError, ValueError, OSError) as error:
+        except BrowserReaderError as error:
+            self.query_failures += 1
+            if self.query_failures < 20:
+                self.window.cursor_status.setText("커서 아래 버튼: 페이지를 읽는 중입니다…")
+            else:
+                self.close()
+                self.window.cursor_status.setText(f"커서 감지 중지: {error}")
+        except (RuntimeError, ValueError, OSError) as error:
             self.close()
             self.window.cursor_status.setText(f"커서 감지 중지: {error}")
         finally:
             self.busy = False
 
     def close(self):
+        self.calibration_generation += 1
+        self.page_poll.stop()
         self.timer.stop()
+        self.query_failures = 0
         self.control.clear_calibration()
         self.reference = None
         if self.reader is not None:
@@ -233,6 +274,9 @@ class BrowserConnection(QObject):
 
     def _launch(self):
         self._existing = False
+        page = Path(__file__).resolve().with_name("test.html")
+        if not page.is_file():
+            raise OSError("보정 화면 test.html을 찾을 수 없습니다.")
         # Remove only stale discovery metadata, never the persistent profile.
         (self.profile / "DevToolsActivePort").unlink(missing_ok=True)
         self.process = subprocess.Popen([
@@ -241,7 +285,7 @@ class BrowserConnection(QObject):
             "--remote-debugging-port=0",
             f"--user-data-dir={self.profile}",
             "--no-first-run", "--no-default-browser-check", "--new-window",
-            "about:blank",
+            page.as_uri(),
         ])
         self.poll.start()
 

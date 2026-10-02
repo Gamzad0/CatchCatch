@@ -1,5 +1,17 @@
 <!doctype html>
 <meta charset="utf-8">
+<p>이 페이지를 클릭해 활성화한 뒤 커서를 '보정 기준' 버튼의 빨간 + 중앙에 놓으세요. 보정 후 이 탭에서 LMS로 이동하세요.</p>
+<style>
+  #reference::after {
+    content: "+";
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    font-size: 24px;
+    color: #c22;
+  }
+</style>
 <button id="reference"
         style="position:absolute;left:100px;top:100px;width:200px;height:80px">
   보정 기준
