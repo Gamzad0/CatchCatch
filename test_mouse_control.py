@@ -113,7 +113,7 @@ def run_workflow_checks():
     import os
     import unittest
     from types import SimpleNamespace
-    from unittest.mock import Mock, call, patch
+    from unittest.mock import Mock, patch
 
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication
@@ -129,17 +129,29 @@ def run_workflow_checks():
 
     class BackInputChecks(unittest.TestCase):
         def setUp(self):
-            self.api = Mock(spec_set=['MapVirtualKey', 'keybd_event'])
+            self.api = Mock(spec_set=['MapVirtualKey', 'GetAsyncKeyState'])
             self.api.MapVirtualKey.side_effect = lambda key, mode: {0x12: 0x38, 0x25: 0x4b}[key]
+            self.api.GetAsyncKeyState.return_value = 0
+            self.gui = Mock(spec_set=['GetForegroundWindow', 'GetClassName'])
+            self.gui.GetForegroundWindow.return_value = 22
+            self.gui.GetClassName.return_value = 'Chrome_WidgetWin_1'
+            self.send_input = Mock(return_value=4)
             self.native_error = type('NativeError', (Exception,), {})
             self.constants = SimpleNamespace(
-                VK_MENU=0x12, VK_LEFT=0x25, KEYEVENTF_EXTENDEDKEY=1, KEYEVENTF_KEYUP=2)
+                VK_MENU=0x12, VK_LEFT=0x25, VK_SHIFT=0x10, VK_CONTROL=0x11,
+                VK_LWIN=0x5b, VK_RWIN=0x5c,
+                KEYEVENTF_EXTENDEDKEY=1, KEYEVENTF_KEYUP=2, KEYEVENTF_SCANCODE=8)
             patches = [
                 patch.dict(sys.modules, {
                     'win32api': self.api, 'win32con': self.constants,
+                    'win32gui': self.gui,
                     'pywintypes': SimpleNamespace(error=self.native_error),
                 }),
                 patch.object(desktop.sys, 'platform', 'win32'),
+                patch.object(desktop.ctypes, 'WinDLL',
+                             return_value=SimpleNamespace(SendInput=self.send_input), create=True),
+                patch.object(desktop.ctypes, 'set_last_error', create=True),
+                patch.object(desktop.ctypes, 'get_last_error', return_value=5, create=True),
                 patch.object(desktop.pyautogui, 'failSafeCheck'),
                 patch.object(desktop.pyautogui, 'hotkey'),
             ]
@@ -149,30 +161,73 @@ def run_workflow_checks():
             self.failsafe, self.hotkey = started[-2:]
             self.control = ComputerControl()
 
+        @staticmethod
+        def keyboard_events(events):
+            return [(event.type, event.ki.wVk, event.ki.wScan, event.ki.dwFlags) for event in events]
+
         def test_windows_back_uses_extended_arrow_and_nonzero_scan_codes(self):
-            self.control.go_back()
-            self.assertEqual(self.api.keybd_event.call_args_list, [
-                call(0x12, 0x38, 0, 0),
-                call(0x25, 0x4b, 1, 0),
-                call(0x25, 0x4b, 3, 0),
-                call(0x12, 0x38, 2, 0),
+            report = self.control.go_back()
+            count, events, size = self.send_input.call_args.args
+            self.assertEqual(count, 4)
+            self.assertEqual(size, 40 if desktop.ctypes.sizeof(desktop.ctypes.c_void_p) == 8 else 28)
+            self.assertEqual(self.keyboard_events(events), [
+                (1, 0, 0x38, 8), (1, 0, 0x4b, 9),
+                (1, 0, 0x4b, 11), (1, 0, 0x38, 10),
             ])
+            self.assertIn('4/4', report)
+            self.send_input.assert_called_once()
             self.failsafe.assert_called_once_with()
             self.hotkey.assert_not_called()
 
-        def test_failed_arrow_input_releases_both_keys_and_reports_failure(self):
-            self.api.keybd_event.side_effect = [None, self.native_error('input failed'), None, None]
-            with self.assertRaisesRegex(RuntimeError, '뒤로 가기 키 입력 실패'):
+        def test_blocked_input_reports_count_and_error_without_retry(self):
+            self.send_input.return_value = 0
+            with self.assertRaisesRegex(RuntimeError, '0/4개.*오류 코드: 5'):
                 self.control.go_back()
-            self.assertEqual(self.api.keybd_event.call_args_list[-2:], [
-                call(0x25, 0x4b, 3, 0), call(0x12, 0x38, 2, 0),
-            ])
+            self.send_input.assert_called_once()
+
+        def test_partial_input_releases_only_keys_still_pressed(self):
+            for accepted, expected in [
+                (1, [(1, 0, 0x38, 10)]),
+                (2, [(1, 0, 0x4b, 11), (1, 0, 0x38, 10)]),
+                (3, [(1, 0, 0x38, 10)]),
+            ]:
+                with self.subTest(accepted=accepted):
+                    self.send_input.reset_mock()
+                    self.send_input.side_effect = [accepted, len(expected)]
+                    with self.assertRaisesRegex(RuntimeError, f'{accepted}/4개'):
+                        self.control.go_back()
+                    self.assertEqual(self.send_input.call_count, 2)
+                    self.assertEqual(self.keyboard_events(self.send_input.call_args.args[1]), expected)
+
+        def test_cleanup_failure_requires_manual_key_release(self):
+            self.send_input.side_effect = [2, 0]
+            with self.assertRaisesRegex(RuntimeError, '키 해제 입력도 실패'):
+                self.control.go_back()
+
+        def test_other_foreground_window_prevents_input(self):
+            self.gui.GetClassName.return_value = 'OtherWindow'
+            with self.assertRaisesRegex(RuntimeError, '전면 창이 Chrome이 아닙니다'):
+                self.control.go_back()
+            self.send_input.assert_not_called()
+
+        def test_pressed_modifier_prevents_input_without_releasing_user_keys(self):
+            self.api.GetAsyncKeyState.return_value = 0x8000
+            with self.assertRaisesRegex(RuntimeError, '키를 놓은 뒤'):
+                self.control.go_back()
+            self.send_input.assert_not_called()
+
+        def test_missing_scan_code_prevents_input(self):
+            self.api.MapVirtualKey.side_effect = None
+            self.api.MapVirtualKey.return_value = 0
+            with self.assertRaisesRegex(RuntimeError, '스캔 코드'):
+                self.control.go_back()
+            self.send_input.assert_not_called()
 
         def test_failsafe_prevents_native_input(self):
             self.failsafe.side_effect = pyautogui.FailSafeException('failsafe')
             with self.assertRaises(pyautogui.FailSafeException):
                 self.control.go_back()
-            self.api.keybd_event.assert_not_called()
+            self.send_input.assert_not_called()
 
     class WindowLayoutChecks(unittest.TestCase):
         def setUp(self):
@@ -829,6 +884,40 @@ def run_workflow_checks():
             self.automation.tick()
             self.assertEqual(list(self.automation.queue), [second])
             self.assertEqual(self.automation.phase, "list")
+
+        def test_back_input_report_is_included_in_return_timeout(self):
+            self.automation.queue.append(self.lecture(1))
+            self.automation.player_reader = self.reader
+            self.reader.page_snapshot.return_value = self.player_snapshot
+            self.automation._set_state("playing")
+            self.automation.phase = "return"
+            self.control.go_back.return_value = 'Windows SendInput: Alt+← 입력 4/4개 접수'
+            self.automation.tick()
+            self.assertIn('4/4', self.window.playback_status.text())
+            workflow.time.monotonic.return_value = 1031
+            self.automation.tick()
+            self.assertEqual(self.automation.state, 'stopped')
+            self.assertIn('재생 페이지 주소가 유지', self.window.playback_status.text())
+            self.assertIn('Windows SendInput', self.window.playback_status.text())
+            self.assertEqual(len(self.automation.queue), 1)
+            self.control.go_back.assert_called_once_with()
+
+        def test_return_navigation_context_error_retries_observation_without_input(self):
+            self.automation.queue.append(self.lecture(1))
+            self.automation.player_reader = self.reader
+            self.automation._set_state("playing")
+            self.automation.phase = "returning"
+            self.automation.deadline = 1030
+            self.reader.page_snapshot.side_effect = [
+                BrowserReaderError('Execution context was destroyed'), self.list_snapshot,
+            ]
+            self.automation.tick()
+            self.assertEqual(self.automation.state, 'playing')
+            self.assertEqual(len(self.automation.queue), 1)
+            self.automation.tick()
+            self.assertFalse(self.automation.queue)
+            self.assertEqual(self.automation.phase, 'list')
+            self.control.go_back.assert_not_called()
 
         def test_new_window_is_deferred_without_registration_or_input(self):
             self.automation.pending = self.identity(1)

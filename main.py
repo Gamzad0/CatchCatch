@@ -327,6 +327,7 @@ class LectureAutomation(QObject):
         self.baseline_pages = set()
         self.deadline = 0.0
         self.wait_until = 0.0
+        self.back_input_summary = ""
         self.scrolled = False
         self.timer = QTimer(self)
         self.timer.setInterval(50)
@@ -450,6 +451,7 @@ class LectureAutomation(QObject):
         self._set_state("playing")
         self.phase = "list"
         self.scrolled = False
+        self.back_input_summary = ""
         self.window.playback_status.setText("강의 목록이 있는 Chrome 페이지를 활성화하면 자동 재생을 시작합니다.")
         self.timer.start()
 
@@ -470,7 +472,8 @@ class LectureAutomation(QObject):
         except WorkflowCancelled:
             pass
         except BrowserReaderError as error:
-            loading = self.state == "pending_player" or (self.state == "playing" and self.phase == "opening")
+            loading = self.state == "pending_player" or (
+                self.state == "playing" and self.phase in {"opening", "returning"})
             if not (loading and error.during_navigation and time.monotonic() < self.deadline):
                 self._fail(error)
         except (RuntimeError, ValueError, OSError, pyautogui.FailSafeException) as error:
@@ -666,6 +669,8 @@ class LectureAutomation(QObject):
                     reason = "등록한 강의 목록과 다른 주소의 페이지가 표시되어 있습니다."
                 if snapshot.url != item.list_url and not snapshot.has_focus:
                     reason += " Chrome 페이지가 활성화되어 있지 않습니다."
+                if self.back_input_summary:
+                    reason += f" 입력 확인: {self.back_input_summary}."
                 raise RuntimeError(f"강의 목록으로 돌아온 상태를 확인하지 못했습니다. {reason}")
 
     def _open_lecture(self, generation, item):
@@ -753,7 +758,11 @@ class LectureAutomation(QObject):
         self.phase = "returning"
         self.deadline = time.monotonic() + 30
         self.window.playback_status.setText("대기 완료. 강의 목록으로 돌아가는 중입니다…")
-        self.inspector.control.go_back()
+        report = self.inspector.control.go_back()
+        self.back_input_summary = report if isinstance(report, str) else ""
+        if self.back_input_summary:
+            self.window.playback_status.setText(
+                f"대기 완료. 강의 목록으로 돌아가는 중입니다… · {self.back_input_summary}")
 
     def _fail(self, error):
         self.stop()

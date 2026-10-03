@@ -27,6 +27,7 @@ Use control.click(*fresh_target.center) only after confirming the active tab
 and querying the target again. A returned position is a snapshot, not a handle.
 """
 
+import ctypes
 import math
 import sys
 from typing import Optional
@@ -34,6 +35,32 @@ from typing import Optional
 import pyautogui
 
 from browser_reader import BrowserReader, ElementPosition
+
+
+class _KeyboardInput(ctypes.Structure):
+    _fields_ = [
+        ('wVk', ctypes.c_uint16), ('wScan', ctypes.c_uint16),
+        ('dwFlags', ctypes.c_uint32), ('time', ctypes.c_uint32),
+        ('dwExtraInfo', ctypes.c_size_t),
+    ]
+
+
+class _MouseInput(ctypes.Structure):
+    # INPUT's union must include MOUSEINPUT to retain the Windows ABI size.
+    _fields_ = [
+        ('dx', ctypes.c_int32), ('dy', ctypes.c_int32),
+        ('mouseData', ctypes.c_uint32), ('dwFlags', ctypes.c_uint32),
+        ('time', ctypes.c_uint32), ('dwExtraInfo', ctypes.c_size_t),
+    ]
+
+
+class _InputUnion(ctypes.Union):
+    _fields_ = [('ki', _KeyboardInput), ('mi', _MouseInput)]
+
+
+class _Input(ctypes.Structure):
+    _anonymous_ = ('data',)
+    _fields_ = [('type', ctypes.c_uint32), ('data', _InputUnion)]
 
 
 class WindowLayout:
@@ -184,29 +211,56 @@ class ComputerControl:
         """Return from a verified same-tab player using real keyboard input."""
         if sys.platform != 'win32':
             pyautogui.hotkey('alt', 'left')
-            return
+            return f'PyAutoGUI Alt+← 입력 경로: {sys.platform}'
         pyautogui.failSafeCheck()
         try:
             import win32api
             import win32con
+            import win32gui
             import pywintypes
         except ImportError as error:
             raise RuntimeError('뒤로 가기 입력에 필요한 pywin32를 찾을 수 없습니다.') from error
         try:
+            foreground = win32gui.GetForegroundWindow()
+            if not foreground or win32gui.GetClassName(foreground) != 'Chrome_WidgetWin_1':
+                raise RuntimeError('뒤로 가기 직전 Windows의 전면 창이 Chrome이 아닙니다. Chrome을 활성화하세요.')
+            modifiers = (win32con.VK_SHIFT, win32con.VK_CONTROL, win32con.VK_MENU,
+                         win32con.VK_LWIN, win32con.VK_RWIN)
+            if any(win32api.GetAsyncKeyState(key) & 0x8000 for key in modifiers):
+                raise RuntimeError('Ctrl·Shift·Alt·Windows 키를 놓은 뒤 자동 재생을 다시 시작하세요.')
             alt_scan = win32api.MapVirtualKey(win32con.VK_MENU, 0)
             left_scan = win32api.MapVirtualKey(win32con.VK_LEFT, 0)
-            # Distinguish the navigation arrow from its numeric-keypad counterpart.
+            if not alt_scan or not left_scan:
+                raise RuntimeError('뒤로 가기에 필요한 키보드 스캔 코드를 확인하지 못했습니다.')
             extended = win32con.KEYEVENTF_EXTENDEDKEY
             released = win32con.KEYEVENTF_KEYUP
-            try:
-                win32api.keybd_event(win32con.VK_MENU, alt_scan, 0, 0)
-                try:
-                    win32api.keybd_event(win32con.VK_LEFT, left_scan, extended, 0)
-                finally:
-                    win32api.keybd_event(win32con.VK_LEFT, left_scan, extended | released, 0)
-            finally:
-                win32api.keybd_event(win32con.VK_MENU, alt_scan, released, 0)
-        except pywintypes.error as error:
+            scan_code = win32con.KEYEVENTF_SCANCODE
+            events = (_Input * 4)()
+            for event, scan, flags in zip(events, (alt_scan, left_scan, left_scan, alt_scan),
+                                         (0, extended, extended | released, released)):
+                event.type = 1  # INPUT_KEYBOARD
+                event.ki = _KeyboardInput(0, scan, scan_code | flags, 0, 0)
+            user32 = ctypes.WinDLL('user32', use_last_error=True)
+            send_input = user32.SendInput
+            send_input.argtypes = (ctypes.c_uint32, ctypes.POINTER(_Input), ctypes.c_int)
+            send_input.restype = ctypes.c_uint32
+            ctypes.set_last_error(0)
+            sent = send_input(len(events), events, ctypes.sizeof(_Input))
+            if sent != len(events):
+                error_code = ctypes.get_last_error()
+                cleanup_failed = False
+                if sent:
+                    # Release only keys whose key-down events were accepted.
+                    pending_releases = [events[2], events[3]] if sent == 2 else [events[3]]
+                    cleanup = (_Input * len(pending_releases))(*pending_releases)
+                    cleanup_failed = send_input(len(cleanup), cleanup, ctypes.sizeof(_Input)) != len(cleanup)
+                message = (f'뒤로 가기 키 입력 실패: Windows가 {sent}/{len(events)}개 입력을 접수했습니다. '
+                           f'Windows 오류 코드: {error_code}.')
+                if cleanup_failed:
+                    message += ' 키 해제 입력도 실패했습니다. Alt·← 키를 직접 눌렀다 놓으세요.'
+                raise RuntimeError(message)
+            return 'Windows SendInput: Alt+← 입력 4/4개 접수, 전면 Chrome 확인'
+        except (pywintypes.error, OSError) as error:
             raise RuntimeError(f'뒤로 가기 키 입력 실패: {error}') from error
 
     def close_player(self):
