@@ -702,8 +702,17 @@ class LectureAutomation(QObject):
         if not math.isclose(video.duration, item.duration, abs_tol=1, rel_tol=0):
             raise RuntimeError("등록한 영상 길이와 현재 영상이 다릅니다.")
         target = self._read(generation, reader.find_player_center)
-        if target is None or target.identity != item.video_identity:
-            raise RuntimeError("등록한 영상과 현재 대상이 다르거나 플레이어 중앙이 가려졌습니다.")
+        if target is None:
+            raise RuntimeError(
+                "플레이어 중앙을 확인할 수 없습니다. 영상 로딩·안내창·스크롤 위치를 확인하세요.")
+        if target.video_id != item.video_identity[0]:
+            raise RuntimeError("영상 요소의 ID가 등록 때와 달라졌습니다.")
+        if target.source != item.video_identity[1]:
+            if target.source.startswith("blob:") or item.video_identity[1].startswith("blob:"):
+                raise RuntimeError(
+                    "영상의 임시(blob) 주소가 등록 때와 달라졌습니다. 같은 강의인지 확인할 식별 기준이 필요합니다.")
+            raise RuntimeError(
+                "영상 주소가 등록 때와 달라졌습니다. 같은 강의에서도 주소가 변경되는지 확인이 필요합니다.")
         fresh_target = self._read(generation, reader.find_player_center)
         fresh_video = self._read(generation, read_video_state, reader)
         fresh = self._read(generation, reader.page_snapshot)
