@@ -658,7 +658,15 @@ class LectureAutomation(QObject):
                 self.phase = "list"
                 self.scrolled = False
             elif time.monotonic() >= self.deadline:
-                raise RuntimeError("강의 목록으로 돌아온 상태를 확인하지 못했습니다.")
+                if snapshot.url == item.list_url:
+                    reason = "강의 목록은 열렸지만 Chrome 페이지가 활성화되어 있지 않습니다."
+                elif snapshot.url == item.player_url:
+                    reason = "뒤로 가기 입력 후에도 재생 페이지 주소가 유지됩니다."
+                else:
+                    reason = "등록한 강의 목록과 다른 주소의 페이지가 표시되어 있습니다."
+                if snapshot.url != item.list_url and not snapshot.has_focus:
+                    reason += " Chrome 페이지가 활성화되어 있지 않습니다."
+                raise RuntimeError(f"강의 목록으로 돌아온 상태를 확인하지 못했습니다. {reason}")
 
     def _open_lecture(self, generation, item):
         snapshot = self._read(generation, self.list_reader.page_snapshot)
@@ -744,6 +752,7 @@ class LectureAutomation(QObject):
             return
         self.phase = "returning"
         self.deadline = time.monotonic() + 30
+        self.window.playback_status.setText("대기 완료. 강의 목록으로 돌아가는 중입니다…")
         self.inspector.control.go_back()
 
     def _fail(self, error):
