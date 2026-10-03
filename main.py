@@ -681,8 +681,7 @@ class LectureAutomation(QObject):
         self._set_state("waiting_list")
         self.window.registration_status.setText(
             f"등록 완료: 영상 {math.ceil(item.duration)}초 · 총 대기 {math.ceil(item.wait_seconds)}초. "
-            "등록 목록에서 대기 시간을 수정할 수 있습니다. "
-            "직접 재생창에서 강의 목록으로 돌아가 다음 영상을 선택하세요.")
+            "강의 목록으로 돌아가 다음 영상을 선택하세요.")
 
     def _release_player(self):
         if self.player_reader is not None and self.owns_player:
@@ -904,7 +903,7 @@ class LectureAutomation(QObject):
         self._release_player()
         self.pending = None
         self.phase = ""
-        self.window.registration_status.setText("영상 등록 대기" if completed else "등록/자동 재생 중지 · 완료 전 영상은 큐에 유지됩니다. 강의 목록으로 돌아가 재시작하거나 등록 목록을 비우세요.")
+        self.window.registration_status.setText("영상 등록 대기" if completed else "등록 중지.")
         self.window.playback_status.setText("모든 영상의 순차 재생을 완료했습니다." if completed else "자동 재생 중지")
         if self.inspector.reader is not None and self.inspector.calibration_geometry is not None:
             self.inspector.timer.start()
