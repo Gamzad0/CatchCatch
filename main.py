@@ -42,7 +42,11 @@ class CursorInspector(QObject):
         self.calibration_geometry = None
         self.window_layout = None
         self.layout_deadline = 0
+        self.calibration_deadline = 0
         self.prepared_geometry = None
+        self.calibration_timer = QTimer(self)
+        self.calibration_timer.setInterval(100)
+        self.calibration_timer.timeout.connect(self._update_calibration_countdown)
         self.layout_poll = QTimer(self)
         self.layout_poll.setInterval(250)
         self.layout_poll.timeout.connect(self._wait_for_layout)
@@ -157,15 +161,24 @@ class CursorInspector(QObject):
             if not stable:
                 return
             self.layout_poll.stop()
-            self.window.cursor_status.setText(
-                "창 배치 완료. 5초 안에 Chrome 페이지를 클릭해 활성화하고 "
-                "'보정 기준' 버튼 중앙에 커서를 놓으세요.")
-            QTimer.singleShot(5000, lambda: self.finish_calibration(generation))
+            self.calibration_deadline = time.monotonic() + 5
+            self.calibration_timer.start()
+            self._update_calibration_countdown()
         except (BrowserReaderError, RuntimeError, ValueError, OSError) as error:
             if generation != self.calibration_generation:
                 return
             self.close()
             self.window.cursor_status.setText(f"보정 실패: {error}")
+
+    def _update_calibration_countdown(self):
+        remaining = max(0, math.ceil(self.calibration_deadline - time.monotonic()))
+        if remaining == 0:
+            self.calibration_timer.stop()
+            self.finish_calibration(self.calibration_generation)
+            return
+        self.window.cursor_status.setText(
+            f"창 배치 완료. {remaining}초 안에 Chrome 페이지를 클릭해 활성화하고 "
+            "'보정 기준' 버튼 중앙에 커서를 놓으세요.")
 
     def finish_calibration(self, generation):
         if generation != self.calibration_generation:
@@ -237,6 +250,7 @@ class CursorInspector(QObject):
         self.calibration_generation += 1
         self.page_poll.stop()
         self.layout_poll.stop()
+        self.calibration_timer.stop()
         self.timer.stop()
         self.query_failures = 0
         self.control.clear_calibration()

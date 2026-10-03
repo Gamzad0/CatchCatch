@@ -56,10 +56,24 @@ class MainWindow(QWidget):
         self.registration_status.setWordWrap(True)
         self.playback_status = QLabel("자동 재생 대기")
         self.playback_status.setWordWrap(True)
-        self.queue_summary = QLabel("등록된 영상: 0개 · 등록 순서대로 재생")
+        self.queue_summary = QLabel("등록된 영상: 0개")
+        self.queue_order_instructions = QLabel("등록 순서대로 재생")
         self.queue_list = QListWidget()
         self.queue_wait_inputs = []
         self._queue_editable = True
+
+        for label in (
+            self.browser_status,
+            self.cursor_status,
+            self.registration_status,
+            self.playback_status,
+            self.queue_summary,
+        ):
+            font = label.font()
+            font.setBold(True)
+            label.setFont(font)
+            label.setWordWrap(True)
+            label.setContentsMargins(0, 6, 0, 6)
 
         layout = QVBoxLayout(self)
         buttons = QHBoxLayout()
@@ -82,6 +96,7 @@ class MainWindow(QWidget):
         queue_header.addWidget(self.queue_summary)
         queue_header.addWidget(self.clear_queue_button)
         layout.addLayout(queue_header)
+        layout.addWidget(self.queue_order_instructions)
         layout.addWidget(self.queue_list)
         layout.addWidget(self.playback_status)
         self.set_workflow_state("idle", has_queue=False)
@@ -97,9 +112,16 @@ class MainWindow(QWidget):
             row_layout.setContentsMargins(6, 4, 6, 4)
             label = QLabel(text)
             label.setWordWrap(True)
+            font = label.font()
+            font.setBold(True)
+            label.setFont(font)
             row_layout.addWidget(label, 1)
-            row_layout.addWidget(QLabel("총 대기"))
+            wait_layout = QVBoxLayout()
+            wait_layout.addWidget(QLabel("총 대기"))
             wait_input = QSpinBox()
+            font = wait_input.font()
+            font.setBold(True)
+            wait_input.setFont(font)
             wait_input.setRange(1, 2147483647)
             wait_input.setSuffix("초")
             wait_input.setValue(wait_seconds)
@@ -109,13 +131,14 @@ class MainWindow(QWidget):
             wait_input.valueChanged.connect(
                 lambda value, row_index=index: self.queue_wait_changed.emit(row_index, value)
             )
-            row_layout.addWidget(wait_input)
+            wait_layout.addWidget(wait_input)
+            row_layout.addLayout(wait_layout)
             item = QListWidgetItem(self.queue_list)
             item.setSizeHint(row.sizeHint())
             self.queue_list.setItemWidget(item, row)
             self.queue_wait_inputs.append(wait_input)
         self.queue_summary.setText(
-            f"등록된 영상: {len(items)}개 · 등록 순서대로 재생"
+            f"등록된 영상: {len(items)}개"
         )
 
     def set_workflow_state(self, state: str, has_queue: bool) -> None:
