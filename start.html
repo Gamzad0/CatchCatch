@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <title>CatchCatch 시작 화면</title>
+  <style>
+    #reference {
+      position: absolute;
+      left: 100px;
+      top: 100px;
+      width: 200px;
+      height: 80px;
+    }
+    #reference::after {
+      content: "+";
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 24px;
+      color: #c22;
+    }
+    .shortcut {
+      position: absolute;
+      left: 100px;
+      top: 220px;
+    }
+    #shortcut {
+      display: inline-block;
+      padding: 12px 24px;
+      border: 1px solid #777;
+      border-radius: 4px;
+      background: #eee;
+      color: #222;
+      text-decoration: none;
+    }
+    #shortcut:hover {
+      background: #ddd;
+    }
+  </style>
+</head>
+<body>
+  <p>이 페이지를 클릭해 활성화한 뒤 커서를 '보정 기준' 버튼의 빨간 + 중앙에 놓으세요. 보정 후 이 탭에서 LMS로 이동하세요.</p>
+  <button id="reference" type="button">보정 기준</button>
+  <div class="shortcut">
+    <!-- 연결할 웹사이트 주소를 href에 입력하세요. 같은 탭에서 이동합니다. -->
+    <a id="shortcut" href="https://eruri.kangwon.ac.kr/login/index.php"
+       onclick="if (!this.getAttribute('href').trim()) event.preventDefault();">웹사이트 바로가기</a>
+    <p>바로가기 주소가 아직 설정되지 않았습니다.</p>
+  </div>
+</body>
+</html>

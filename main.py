@@ -25,7 +25,7 @@ from video_state import read_video_state
 
 
 class CursorInspector(QObject):
-    """Calibrate on the initial test page, then inspect its current tab."""
+    """Calibrate on the start page, then inspect its current tab."""
 
     def __init__(self, window, connection):
         super().__init__(window)
@@ -68,13 +68,13 @@ class CursorInspector(QObject):
 
     def _find_test_page(self):
         try:
-            websocket = find_test_websocket(self.connection.endpoint)
+            websocket = find_test_websocket(self.connection.endpoint, page_name="start.html")
         except TestPageNotOpen:
             if self.page_attempts == 0 and self.connection._existing:
-                page = Path(__file__).resolve().with_name("test.html")
+                page = Path(__file__).resolve().with_name("start.html")
                 if not page.is_file():
                     self.close()
-                    self.window.cursor_status.setText("보정 화면 test.html을 찾을 수 없습니다.")
+                    self.window.cursor_status.setText("초기 화면 start.html을 찾을 수 없습니다.")
                     return
                 try:
                     subprocess.Popen([
@@ -882,9 +882,9 @@ class BrowserConnection(QObject):
 
     def _launch(self):
         self._existing = False
-        page = Path(__file__).resolve().with_name("test.html")
+        page = Path(__file__).resolve().with_name("start.html")
         if not page.is_file():
-            raise OSError("보정 화면 test.html을 찾을 수 없습니다.")
+            raise OSError("초기 화면 start.html을 찾을 수 없습니다.")
         # Remove only stale discovery metadata, never the persistent profile.
         (self.profile / "DevToolsActivePort").unlink(missing_ok=True)
         self.process = subprocess.Popen([
@@ -963,7 +963,7 @@ class BrowserConnection(QObject):
 
 
 def place_application(window):
-    """Place the GUI at startup; Chrome is placed after its test tab is identified."""
+    """Place the GUI at startup; Chrome is placed after its start tab is identified."""
     if sys.platform != "win32":
         return
     try:

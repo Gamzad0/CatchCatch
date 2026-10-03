@@ -37,8 +37,8 @@ class TestPageNotOpen(RuntimeError):
     """No matching test tab; opening the local page is permitted."""
 
 
-def find_test_websocket(endpoint):
-    """Discover exactly one local test page using read-only CDP metadata."""
+def find_test_websocket(endpoint, page_name="test.html"):
+    """Discover exactly one requested local page using read-only CDP metadata."""
     address = urlsplit(endpoint)
     if (address.scheme != "http" or address.hostname != "127.0.0.1"
             or not address.port or address.username or address.password
@@ -52,13 +52,13 @@ def find_test_websocket(endpoint):
         tabs = json.load(response)
     if not isinstance(tabs, list):
         raise ValueError("브라우저 탭 목록을 확인할 수 없습니다.")
-    expected = QUrl.fromLocalFile(str(Path(__file__).resolve().with_name("test.html")))
+    expected = QUrl.fromLocalFile(str(Path(__file__).resolve().with_name(page_name)))
     matches = [tab for tab in tabs if isinstance(tab, dict)
                and tab.get("type") == "page" and QUrl(tab.get("url", "")) == expected]
     if not matches:
-        raise TestPageNotOpen("전용 Chrome에 테스트 페이지가 열려 있지 않습니다.")
+        raise TestPageNotOpen(f"전용 Chrome에 {page_name} 페이지가 열려 있지 않습니다.")
     if len(matches) > 1:
-        raise RuntimeError("테스트 페이지가 여러 개 열려 있습니다. test.html 탭을 하나만 남기고 다시 실행하세요.")
+        raise RuntimeError(f"{page_name} 페이지가 여러 개 열려 있습니다. 해당 탭을 하나만 남기고 다시 실행하세요.")
     websocket = matches[0].get("webSocketDebuggerUrl", "")
     url = urlsplit(websocket)
     if (url.scheme != "ws" or url.hostname != "127.0.0.1"
@@ -205,7 +205,7 @@ def run_workflow_checks():
             self.reference = ElementPosition('button', 100, 100, 200, 80)
             self.reader.find_clickable.return_value = self.reference
             self.snapshot = PageSnapshot(
-                'file:///test.html', True, 0, 40, 959, 1040, 939, 940, 1.25)
+                'file:///start.html', True, 0, 40, 959, 1040, 939, 940, 1.25)
             self.reader.page_snapshot.return_value = self.snapshot
             self.layout = Mock()
             self.layout.ready.return_value = False
@@ -255,7 +255,7 @@ def run_workflow_checks():
             self.layout.ready.return_value = True
             self.inspector._wait_for_layout()
             self.countdown.assert_not_called()
-            resized = PageSnapshot('file:///test.html', True, 0, 40, 959, 1040, 939, 900, 1.25)
+            resized = PageSnapshot('file:///start.html', True, 0, 40, 959, 1040, 939, 900, 1.25)
             self.reader.page_snapshot.return_value = resized
             self.inspector._wait_for_layout()
             self.countdown.assert_not_called()
@@ -285,7 +285,7 @@ def run_workflow_checks():
         def test_changed_display_scale_during_countdown_cancels_calibration(self):
             self.prepare_countdown()
             self.reader.page_snapshot.return_value = PageSnapshot(
-                'file:///test.html', True, 0, 40, 959, 1040, 939, 940, 1.5)
+                'file:///start.html', True, 0, 40, 959, 1040, 939, 940, 1.5)
             self.countdown.call_args.args[1]()
             self.inspector.control.calibrate.assert_not_called()
             self.assertIsNone(self.inspector.calibration_geometry)
