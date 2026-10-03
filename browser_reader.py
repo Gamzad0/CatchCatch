@@ -307,6 +307,13 @@ class BrowserReader:
         result = self._command('Runtime.evaluate',
                                {'expression': expression, 'returnByValue': True})
         if 'exceptionDetails' in result:
+            details = result['exceptionDetails']
+            description = (details.get('exception', {}).get('description')
+                           or details.get('text'))
+            # Show the exception message, without the JavaScript stack trace.
+            if isinstance(description, str) and description.strip():
+                reason = description.strip().splitlines()[0][:300]
+                raise BrowserReaderError(f'DOM query failed: {reason}')
             raise BrowserReaderError('DOM query failed; check selector and page context')
         remote = result.get('result', {})
         if 'value' not in remote:

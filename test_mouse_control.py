@@ -209,6 +209,40 @@ def run_workflow_checks():
             self.assertFalse(self.automation.queue)
             self.control.click.assert_not_called()
 
+        def test_dom_query_error_preserves_exception_message_without_stack(self):
+            reader = SimpleNamespace(_command=Mock(return_value={
+                'exceptionDetails': {
+                    'text': 'Uncaught',
+                    'exception': {
+                        'description': 'Error: Expected HTML video\n    at <anonymous>:5:12'
+                    },
+                },
+            }))
+            with self.assertRaises(BrowserReaderError) as caught:
+                BrowserReader._evaluate(reader, 'unused')
+            self.assertEqual(str(caught.exception), 'DOM query failed: Error: Expected HTML video')
+
+        def test_dom_query_error_falls_back_to_cdp_exception_text(self):
+            reader = SimpleNamespace(_command=Mock(return_value={
+                'exceptionDetails': {'text': 'Execution context was destroyed'},
+            }))
+            with self.assertRaises(BrowserReaderError) as caught:
+                BrowserReader._evaluate(reader, 'unused')
+            self.assertIn('Execution context was destroyed', str(caught.exception))
+
+        def test_registration_query_failure_shows_operation_and_stops_before_input(self):
+            def page_snapshot():
+                raise BrowserReaderError('DOM query failed: ReferenceError: document is not defined')
+
+            self.reader.page_snapshot = page_snapshot
+            self.automation._set_state('registering')
+            self.automation.tick()
+            self.assertEqual(self.automation.state, 'stopped')
+            self.assertIn('page_snapshot: DOM query failed: ReferenceError: document is not defined',
+                          self.window.playback_status.text())
+            self.assertFalse(self.automation.queue)
+            self.control.click.assert_not_called()
+
         def test_invalid_duration_is_rejected_before_queue_append(self):
             for duration in (float("nan"), float("inf"), 0.0, -1.0):
                 with self.subTest(duration=duration):

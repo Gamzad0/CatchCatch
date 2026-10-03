@@ -266,7 +266,12 @@ class LectureAutomation(QObject):
             raise WorkflowCancelled()
 
     def _read(self, generation, operation, *args):
-        result = operation(*args)
+        try:
+            result = operation(*args)
+        except BrowserReaderError as error:
+            self._guard(generation)
+            name = getattr(operation, '__name__', 'CDP 조회')
+            raise BrowserReaderError(f'{name}: {error}') from error
         self._guard(generation)
         return result
 
