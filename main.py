@@ -768,7 +768,7 @@ class LectureAutomation(QObject):
         self._verify_snapshot(snapshot, item.list_url, item.list_geometry)
         self._verify_calibration(self.list_reader, snapshot)
         if not snapshot.has_focus:
-            self.window.playback_status.setText("등록한 강의 목록의 Chrome 페이지를 활성화하세요.")
+            self.window.playback_status.setText("chrome을 클릭헤주세요.")
             return
         target = self._read(generation, self.list_reader.find_registered_clickable, item.identity)
         if target is None:
