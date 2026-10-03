@@ -177,8 +177,7 @@ class CursorInspector(QObject):
             self.finish_calibration(self.calibration_generation)
             return
         self.window.cursor_status.setText(
-            f"창 배치 완료. {remaining}초 안에 Chrome 페이지를 클릭해 활성화하고 "
-            "'보정 기준' 버튼 중앙에 커서를 놓으세요.")
+            f"창 배치 완료. Chrome을 클릭한 뒤 빨간 + 중앙에 커서를 유지하세요. ({remaining}초)")
 
     def finish_calibration(self, generation):
         if generation != self.calibration_generation:
@@ -206,7 +205,7 @@ class CursorInspector(QObject):
             self.control.calibrate(*fresh.center, scale=snapshot.device_pixel_ratio)
             self.calibration_geometry = snapshot.geometry
             self.window.browser_status.setText(
-                "보정 완료. 같은 Chrome 탭에서 LMS로 이동하세요. 로그인 후 버튼 위에 커서를 놓으면 이름을 표시합니다.")
+                "보정 완료. 같은 Chrome 탭에서 LMS 강의 목록을 여세요.")
             self.timer.start()
             self.update_cursor()
         except (BrowserReaderError, RuntimeError, ValueError, OSError) as error:
@@ -375,7 +374,6 @@ class LectureAutomation(QObject):
     def _check_playback_readiness(self):
         if not self._review_visible or self._starting_from_review:
             return
-        self.window.set_playback_ready(False, "강의 목록을 확인하는 중입니다…")
         if not self.queue:
             self.window.set_playback_ready(False, "먼저 시청할 강의를 등록하세요.")
             return
@@ -406,7 +404,7 @@ class LectureAutomation(QObject):
                 message = "브라우저 위치·크기 또는 배율이 바뀌었습니다. 다시 보정하고 등록하세요."
             else:
                 ready = True
-                message = "강의 목록 확인 완료. 자동 재생을 시작할 수 있습니다."
+                message = "‘재생 시작’을 누르세요."
         except (BrowserReaderError, RuntimeError, ValueError, OSError):
             ready = False
             message = "페이지 상태를 확인하지 못했습니다. 강의 목록을 열어주세요."
@@ -450,8 +448,7 @@ class LectureAutomation(QObject):
 
     def _show_queue(self):
         self.window.set_queue([
-            (f"{index}. {item.identity.label or item.identity.tag} · "
-             f"영상 {math.ceil(item.duration)}초", math.ceil(item.wait_seconds))
+            (f"{index}. {item.identity.label or item.identity.tag}", math.ceil(item.wait_seconds))
             for index, item in enumerate(self.queue, 1)
         ])
 
@@ -496,7 +493,7 @@ class LectureAutomation(QObject):
                 raise RuntimeError("기존 큐와 같은 강의 목록·창 상태에서 추가 등록하세요. 새로 등록하려면 먼저 등록 목록을 비우세요.")
             self.baseline_pages = set(browser_pages(self.connection.endpoint))
             self._read(generation, self.list_reader.start_click_observation)
-            self.window.registration_status.setText("강의 목록에서 등록할 영상 항목을 클릭하세요.")
+            self.window.registration_status.setText("Chrome에서 시청할 강의를 클릭하세요.")
             self.timer.start()
         except WorkflowCancelled:
             pass
@@ -507,7 +504,7 @@ class LectureAutomation(QObject):
         if self.state not in {"registering", "waiting_list"} or not self.queue:
             return
         if self.busy:
-            self.window.registration_status.setText("페이지 확인이 끝난 뒤 등록 완료를 다시 누르세요.")
+            self.window.registration_status.setText("잠시 후 ‘재생 시작’을 다시 누르세요.")
             return
         try:
             generation = self.generation
@@ -516,7 +513,7 @@ class LectureAutomation(QObject):
             # A final popup must be returned from manually before finishing.
             if self.player_reader is not None:
                 if self.owns_player and set(browser_pages(self.connection.endpoint)) - self.baseline_pages:
-                    raise RuntimeError("마지막 영상 재생창을 닫고 강의 목록으로 돌아온 뒤 등록 완료를 누르세요.")
+                    raise RuntimeError("재생창을 닫고 강의 목록에서 ‘재생 시작’을 누르세요.")
                 self._guard(generation)
                 self._release_player()
                 self._guard(generation)
@@ -542,7 +539,7 @@ class LectureAutomation(QObject):
         self.phase = "list"
         self.scrolled = False
         self.back_input_summary = ""
-        self.window.playback_status.setText("강의 목록이 있는 Chrome 페이지를 활성화하면 자동 재생을 시작합니다.")
+        self.window.playback_status.setText("Chrome 강의 목록을 클릭하면 재생을 시작합니다.")
         self.timer.start()
 
     def tick(self):
@@ -610,7 +607,7 @@ class LectureAutomation(QObject):
             self.window.registration_status.setText("이미 등록한 강의입니다. 목록으로 돌아가 다음 강의를 선택하세요.")
             return
         self.window.registration_status.setText(
-            "선택한 강의의 재생 페이지와 영상 정보가 준비되면 자동으로 등록합니다.")
+            "영상 정보를 확인하는 중입니다…")
 
     def _locate_player(self, generation, navigation=None):
         """Only the original calibrated tab is supported; new windows are deferred."""
@@ -680,8 +677,7 @@ class LectureAutomation(QObject):
         self._show_queue()
         self._set_state("waiting_list")
         self.window.registration_status.setText(
-            f"등록 완료: 영상 {math.ceil(item.duration)}초 · 총 대기 {math.ceil(item.wait_seconds)}초. "
-            "강의 목록으로 돌아가 다음 영상을 선택하세요.")
+            "등록했습니다. Chrome에서 강의 목록으로 돌아가세요.")
 
     def _release_player(self):
         if self.player_reader is not None and self.owns_player:
@@ -707,7 +703,7 @@ class LectureAutomation(QObject):
         self._guard(generation)
         self._read(generation, self.list_reader.start_click_observation)
         self._set_state("registering")
-        self.window.registration_status.setText("다음 영상 항목을 클릭하거나 등록 완료를 누르세요.")
+        self.window.registration_status.setText("다음 강의를 클릭하거나 ‘재생 시작’을 누르세요.")
 
     def _play_tick(self, generation):
         if not self.queue:
@@ -734,7 +730,7 @@ class LectureAutomation(QObject):
         elif self.phase == "watching":
             remaining = max(0, math.ceil(self.wait_until - time.monotonic()))
             self.window.playback_status.setText(
-                f"재생 중: {item.identity.label or item.identity.tag} · 다음 전환까지 {remaining}초 · 남은 영상 {len(self.queue)}개")
+                f"다음 강의 전환까지 {remaining}초")
             if remaining == 0:
                 self.phase = "return"
         elif self.phase == "return":
@@ -767,7 +763,7 @@ class LectureAutomation(QObject):
         self._verify_snapshot(snapshot, item.list_url, item.list_geometry)
         self._verify_calibration(self.list_reader, snapshot)
         if not snapshot.has_focus:
-            self.window.playback_status.setText("chrome을 클릭헤주세요.")
+            self.window.playback_status.setText("Chrome 강의 목록을 클릭하세요.")
             return
         target = self._read(generation, self.list_reader.find_registered_clickable, item.identity)
         if target is None:
@@ -793,7 +789,7 @@ class LectureAutomation(QObject):
         self.phase = "opening"
         self.deadline = time.monotonic() + 30
         self.inspector.control.click(*fresh.center)
-        self.window.playback_status.setText(f"영상 열기: {item.identity.label or item.identity.tag}")
+        self.window.playback_status.setText("강의를 여는 중입니다…")
 
     def _start_video(self, generation, item):
         reader = self._locate_player(generation, item.navigation)
@@ -865,12 +861,9 @@ class LectureAutomation(QObject):
             raise RuntimeError("모서리를 클릭했지만 플레이어의 키보드 포커스 해제를 확인하지 못했습니다.")
         self.phase = "returning"
         self.deadline = time.monotonic() + 30
-        self.window.playback_status.setText("대기 완료. 강의 목록으로 돌아가는 중입니다…")
+        self.window.playback_status.setText("강의 목록으로 돌아가는 중입니다…")
         report = self.inspector.control.go_back()
         self.back_input_summary = report if isinstance(report, str) else ""
-        if self.back_input_summary:
-            self.window.playback_status.setText(
-                f"대기 완료. 강의 목록으로 돌아가는 중입니다… · {self.back_input_summary}")
 
     def _fail(self, error):
         self.stop()
@@ -1059,8 +1052,7 @@ class BrowserConnection(QObject):
         self.deadline.stop()
         self.window.browser_button.setEnabled(True)
         self.window.browser_status.setText(
-            "브라우저 연결 완료. 열린 전용 Chrome에서 LMS를 이용하세요. "
-            "최초 이용 시 로그인하세요.")
+            "브라우저 연결 완료. 보정 화면을 준비합니다.")
 
     def _socket_error(self, _error):
         if not self._working:

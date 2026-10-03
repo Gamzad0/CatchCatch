@@ -699,7 +699,7 @@ def run_workflow_checks():
             self.assertEqual(self.automation.phase, "list")
             self.assertEqual(len(self.automation.queue), 1)
             self.control.click.assert_not_called()
-            self.assertNotIn('Space', self.window.registration_instructions.text())
+            self.assertFalse(self.window.queue_wait_inputs[0].isEnabled())
 
         def test_cdp_rejection_retains_navigation_reason(self):
             socket = Mock()
@@ -968,11 +968,11 @@ def run_workflow_checks():
             self.automation.phase = "return"
             self.control.go_back.return_value = 'Windows SendInput: Alt+← 입력 4/4개 접수'
             self.automation.tick()
-            self.assertIn('4/4', self.window.playback_status.text())
             workflow.time.monotonic.return_value = 1031
             self.automation.tick()
             self.assertEqual(self.automation.state, 'stopped')
             self.assertIn('재생 페이지 주소가 유지', self.window.playback_status.text())
+            self.assertIn('4/4', self.window.playback_status.text())
             self.assertIn('Windows SendInput', self.window.playback_status.text())
             self.assertEqual(len(self.automation.queue), 1)
             self.control.go_back.assert_called_once_with()
