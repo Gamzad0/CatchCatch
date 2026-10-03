@@ -7,7 +7,8 @@ Press Enter using the keyboard without moving the cursor from the requested
 point. Chrome's devicePixelRatio accounts for display scale and desktop zoom.
 
 Run with --workflow-checks for offline registration and queue regression checks.
-That mode uses an offscreen Qt window and mocked browser/mouse access.
+That mode uses offscreen Qt windows, local HTML video fixtures, and mocked
+LMS/mouse access.
 
 Required buttons in test.html:
     #reference: the upper-left button labeled '보정 기준'.
@@ -108,7 +109,7 @@ def check_calibration_scale(reader, control):
 
 
 def run_workflow_checks():
-    """Exercise registration and queue transitions without Chrome or real input."""
+    """Exercise registration, queue transitions, and local HTML without real input."""
     import os
     import unittest
     from types import SimpleNamespace
@@ -116,9 +117,11 @@ def run_workflow_checks():
 
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication
+    from PySide6.QtCore import QEvent, QEventLoop, QTimer
+    from PySide6.QtWebEngineWidgets import QWebEngineView
     from browser_reader import ClickedElement, ElementIdentity, ElementPosition, PageSnapshot, VideoCapture
     from ui import MainWindow
-    from video_state import VideoState
+    from video_state import VideoState, read_video_state
     import main as workflow
 
     app = QApplication.instance() or QApplication([])
@@ -367,7 +370,144 @@ def run_workflow_checks():
             self.player.close.assert_called_once_with()
             self.assertFalse(self.automation.queue)
 
-    suite = unittest.defaultTestLoader.loadTestsFromTestCase(WorkflowChecks)
+    class VideoElementChecks(unittest.TestCase):
+        """Execute the production JavaScript on a local HTML player fixture."""
+
+        def setUp(self):
+            from collections import deque
+
+            self.view = QWebEngineView()
+            self.view.resize(1200, 800)
+            self.view.show()
+            self.page = self.view.page()
+
+            def load(callback):
+                self.page.loadFinished.connect(callback)
+                self.page.setHtml('''<!doctype html><html><head><style>
+                    #my-video {position: absolute; left: 100px; top: 100px;
+                               width: 600px; height: 400px;}
+                    video {width: 100%; height: 100%;}
+                    #play {position: absolute; left: 280px; top: 180px;
+                           width: 80px; height: 40px;}
+                </style></head><body>
+                    <div id="my-video" class="video-js">
+                        <video id="my-video_html5_api"></video><button id="play">Play</button>
+                    </div>
+                </body></html>''')
+
+            self.assertTrue(self.wait_for_result(load))
+            self.page.loadFinished.disconnect()
+            self.evaluate('''
+                var video = document.querySelector('video');
+                var player = document.querySelector('#my-video');
+                Object.defineProperties(video, {
+                    duration: {value: 60.5, configurable: true},
+                    currentTime: {value: 10, configurable: true},
+                    paused: {value: true, configurable: true},
+                    ended: {value: false, configurable: true},
+                    readyState: {value: 4, configurable: true}
+                });
+                true;
+            ''')
+            self.reader = SimpleNamespace(
+                _evaluate=self.evaluate, _binding_installed=True, _observation_mode=None,
+                _observation_error=None, _clicks=deque(), _video_captures=deque(),
+                _binding_name='_test_capture', _listener_name='_test_listeners')
+
+        def tearDown(self):
+            self.view.close()
+            self.view.deleteLater()
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            app.processEvents()
+
+        def wait_for_result(self, start):
+            loop, timer, values = QEventLoop(), QTimer(), []
+            timer.setSingleShot(True)
+            timer.timeout.connect(loop.quit)
+
+            def received(value):
+                values.append(value)
+                loop.quit()
+
+            timer.start(5000)
+            start(received)
+            if not values:
+                loop.exec()
+            timer.stop()
+            self.assertTrue(values, 'Local player fixture timed out')
+            return values[0]
+
+        def evaluate(self, expression):
+            script = ('(() => { try { return JSON.stringify({value: (0, eval)(' +
+                      json.dumps(expression) + ')}); } catch (error) {'
+                      'return JSON.stringify({error: error.toString()}); } })()')
+            result = self.wait_for_result(lambda callback: self.page.runJavaScript(script, callback))
+            response = json.loads(result)
+            if 'error' in response:
+                raise BrowserReaderError(response['error'])
+            return response.get('value')
+
+        def test_wrapped_video_state_reads_actual_video(self):
+            self.assertEqual(read_video_state(self.reader), VideoState(60.5, 10, True, False, 4))
+
+        def test_direct_video_state_remains_supported(self):
+            self.evaluate("player.replaceWith(video); video.id = 'my-video'; true;")
+            self.assertEqual(read_video_state(self.reader), VideoState(60.5, 10, True, False, 4))
+
+        def test_missing_player_waits(self):
+            self.evaluate('player.remove(); true;')
+            self.assertIsNone(read_video_state(self.reader))
+
+        def test_empty_player_waits(self):
+            self.evaluate('video.remove(); true;')
+            self.assertIsNone(read_video_state(self.reader))
+
+        def test_loading_video_waits(self):
+            self.evaluate('Object.defineProperty(video, "duration", {value: NaN}); true;')
+            self.assertIsNone(read_video_state(self.reader))
+
+        def test_duplicate_player_is_rejected(self):
+            self.evaluate('document.body.appendChild(player.cloneNode(true)); true;')
+            with self.assertRaisesRegex(BrowserReaderError, 'Ambiguous'):
+                read_video_state(self.reader)
+
+        def test_multiple_inner_videos_are_rejected(self):
+            self.evaluate('player.appendChild(video.cloneNode()); true;')
+            with self.assertRaisesRegex(BrowserReaderError, 'Ambiguous'):
+                read_video_state(self.reader)
+
+        def test_wrapped_video_coordinates_reject_outside_and_unrelated_overlay(self):
+            self.assertTrue(BrowserReader.video_point_is_visible(self.reader, 400, 300))
+            self.assertFalse(BrowserReader.video_point_is_visible(self.reader, 50, 300))
+            self.evaluate('''
+                var cover = document.createElement('div');
+                cover.style = 'position: fixed; inset: 0; z-index: 100;';
+                document.body.appendChild(cover);
+                true;
+            ''')
+            self.assertFalse(BrowserReader.video_point_is_visible(self.reader, 400, 300))
+
+        def test_space_registration_captures_wrapped_video_duration(self):
+            self.evaluate('''
+                var callbacks = {}, captures = [];
+                document.hasFocus = () => true;
+                document.addEventListener = (kind, listener) => { callbacks[kind] = listener; };
+                window._test_capture = value => captures.push(JSON.parse(value));
+                true;
+            ''')
+            BrowserReader._start_observation(self.reader, 'video')
+            self.evaluate('''
+                callbacks.pointermove({isTrusted: true, clientX: 400, clientY: 300});
+                callbacks.keyup({isTrusted: true, code: 'Space'});
+                true;
+            ''')
+            self.assertEqual(self.evaluate('captures'), [
+                {'mode': 'video', 'web_x': 400, 'web_y': 300, 'duration': 60.5}])
+
+    suite = unittest.TestSuite([
+        unittest.defaultTestLoader.loadTestsFromTestCase(WorkflowChecks),
+        unittest.defaultTestLoader.loadTestsFromTestCase(VideoElementChecks),
+    ])
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     # Keep the application alive until every QObject in the checks is cleaned up.
     app.processEvents()

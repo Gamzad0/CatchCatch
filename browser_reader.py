@@ -180,12 +180,23 @@ function registeredElement(expected) {
 }
 """
 
-_VIDEO_POINT_HELPER = r"""
-function videoPointIsVisible(x, y) {
+_VIDEO_ELEMENT_HELPER = r"""
+function lectureVideo() {
     const matches = document.querySelectorAll('#my-video');
-    if (matches.length !== 1) return false;
-    const video = matches[0];
-    if (!(video instanceof HTMLVideoElement)) return false;
+    if (matches.length > 1) throw new Error('Ambiguous video player');
+    const player = matches[0];
+    if (!player) return null;
+    if (player instanceof HTMLVideoElement) return player;
+    const videos = player.querySelectorAll('video');
+    if (videos.length > 1) throw new Error('Ambiguous HTML video inside player');
+    return videos[0] || null;
+}
+"""
+
+_VIDEO_POINT_HELPER = _VIDEO_ELEMENT_HELPER + r"""
+function videoPointIsVisible(x, y) {
+    const video = lectureVideo();
+    if (!video) return false;
     const rect = video.getBoundingClientRect();
     const style = getComputedStyle(video);
     if (style.visibility !== 'visible' || Number(style.opacity) === 0 ||
@@ -516,8 +527,8 @@ class BrowserReader:
                 add('keyup', event => {
                     if (!event.isTrusted || event.code !== 'Space' || !document.hasFocus()) return;
                     try {
-                        const video = document.querySelector('#my-video');
-                        if (!pointer || performance.now() - pointer.time > 30000 ||
+                        const video = lectureVideo();
+                        if (!video || !pointer || performance.now() - pointer.time > 30000 ||
                             !videoPointIsVisible(pointer.x, pointer.y) ||
                             !Number.isFinite(video.duration) || video.duration <= 0) {
                             send({error: true}); return;

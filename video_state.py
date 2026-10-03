@@ -27,15 +27,12 @@ class VideoState:
 
 
 def read_video_state(reader: 'BrowserReader') -> Optional[VideoState]:
-    """None means #my-video is absent or its finite duration is not ready yet."""
-    from browser_reader import BrowserReaderError
+    """Read #my-video itself or its unique inner video; None means not ready."""
+    from browser_reader import BrowserReaderError, _VIDEO_ELEMENT_HELPER
 
-    value = reader._evaluate('''(() => {
-        const matches = document.querySelectorAll('#my-video');
-        if (matches.length > 1) throw new Error('Ambiguous video player');
-        const video = matches[0];
+    value = reader._evaluate('(() => {' + _VIDEO_ELEMENT_HELPER + '''
+        const video = lectureVideo();
         if (!video) return null;
-        if (!(video instanceof HTMLVideoElement)) throw new Error('Expected HTML video');
         if (!Number.isFinite(video.duration) || video.duration <= 0) return null;
         return {duration: video.duration, current_time: video.currentTime,
                 paused: video.paused, ended: video.ended, ready_state: video.readyState};
