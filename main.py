@@ -5,7 +5,7 @@ import json
 import math
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, build_opener
@@ -251,13 +251,14 @@ class CursorInspector(QObject):
 
 @dataclass(frozen=True)
 class RegisteredLecture:
+    """The registered player URL identifies the lecture across page visits."""
+
     identity: object
     list_url: str
     list_geometry: tuple
     player_url: str
     player_geometry: tuple
     player_control: ComputerControl
-    video_identity: tuple = field(repr=False)
     duration: float
     navigation: str
 
@@ -562,14 +563,14 @@ class LectureAutomation(QObject):
         fresh = self._read(generation, reader.page_snapshot)
         self._verify_snapshot(fresh, snapshot.url, snapshot.geometry)
         self._verify_calibration(reader, fresh)
-        if (not fresh.has_focus or fresh_target != target or fresh_video is None or
+        if (not fresh.has_focus or fresh_target is None or
+                fresh_target.position != target.position or fresh_video is None or
                 fresh_video.duration != video.duration):
             self._wait_for_registration()
             return
         item = RegisteredLecture(
             self.pending, self.list_url, self.list_geometry, snapshot.url,
-            snapshot.geometry, self.inspector.control, target.identity,
-            video.duration, "same")
+            snapshot.geometry, self.inspector.control, video.duration, "same")
         self.queue.append(item)
         self.pending = None
         self._show_queue()
@@ -618,11 +619,9 @@ class LectureAutomation(QObject):
             self._verify_snapshot(snapshot, item.player_url, item.player_geometry)
             self._verify_calibration(self.player_reader, snapshot)
             target = self._read(generation, self.player_reader.find_player_center)
-            if target is None or target.identity != item.video_identity:
-                raise RuntimeError("재생 확인 중 영상 대상이 바뀌거나 플레이어가 가려졌습니다.")
+            if target is None:
+                raise RuntimeError("재생 확인 중 플레이어 중앙을 확인할 수 없습니다.")
             video = self._read(generation, read_video_state, self.player_reader)
-            if video is not None and not math.isclose(video.duration, item.duration, abs_tol=1, rel_tol=0):
-                raise RuntimeError("재생 확인 중 영상 길이가 바뀌었습니다.")
             if snapshot.has_focus and video is not None and video.playing:
                 self.wait_until = time.monotonic() + item.wait_seconds
                 self.phase = "watching"
@@ -699,27 +698,18 @@ class LectureAutomation(QObject):
             if time.monotonic() >= self.deadline:
                 raise RuntimeError("영상 메타데이터가 준비되지 않았습니다.")
             return
-        if not math.isclose(video.duration, item.duration, abs_tol=1, rel_tol=0):
-            raise RuntimeError("등록한 영상 길이와 현재 영상이 다릅니다.")
         target = self._read(generation, reader.find_player_center)
         if target is None:
             raise RuntimeError(
                 "플레이어 중앙을 확인할 수 없습니다. 영상 로딩·안내창·스크롤 위치를 확인하세요.")
-        if target.video_id != item.video_identity[0]:
-            raise RuntimeError("영상 요소의 ID가 등록 때와 달라졌습니다.")
-        if target.source != item.video_identity[1]:
-            if target.source.startswith("blob:") or item.video_identity[1].startswith("blob:"):
-                raise RuntimeError(
-                    "영상의 임시(blob) 주소가 등록 때와 달라졌습니다. 같은 강의인지 확인할 식별 기준이 필요합니다.")
-            raise RuntimeError(
-                "영상 주소가 등록 때와 달라졌습니다. 같은 강의에서도 주소가 변경되는지 확인이 필요합니다.")
         fresh_target = self._read(generation, reader.find_player_center)
         fresh_video = self._read(generation, read_video_state, reader)
         fresh = self._read(generation, reader.page_snapshot)
         self._verify_snapshot(fresh, item.player_url, item.player_geometry)
         self._verify_calibration(reader, fresh)
-        if (not fresh.has_focus or fresh_target != target or fresh_video is None or
-                not math.isclose(fresh_video.duration, item.duration, abs_tol=1, rel_tol=0)):
+        if (not fresh.has_focus or fresh_target is None or
+                fresh_target.position != target.position or fresh_video is None or
+                fresh_video.duration != video.duration):
             raise RuntimeError("재생 직전에 활성 페이지·영상·플레이어 위치가 바뀌었습니다.")
         if fresh_video.playing:
             self.wait_until = time.monotonic() + item.wait_seconds

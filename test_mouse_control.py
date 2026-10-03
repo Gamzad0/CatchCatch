@@ -380,7 +380,7 @@ def run_workflow_checks():
             return workflow.RegisteredLecture(
                 self.identity(number), self.list_snapshot.url, self.list_snapshot.geometry,
                 self.player_snapshot.url, self.player_snapshot.geometry, self.control,
-                self.target.identity, duration, navigation)
+                duration, navigation)
 
         def pending_metadata(self, number, duration):
             self.automation.pending = self.identity(number)
@@ -398,13 +398,24 @@ def run_workflow_checks():
             entries = list(self.automation.queue)
             self.assertEqual([entry.identity for entry in entries], [self.identity(1), self.identity(2)])
             self.assertEqual([entry.wait_seconds for entry in entries], [240.5, 270.0])
-            self.assertEqual(entries[0].video_identity, self.target.identity)
+            self.assertEqual(entries[0].player_url, self.player_snapshot.url)
             self.assertIs(entries[0].player_control, self.control)
             workflow.pyautogui.position.assert_not_called()
             workflow.ComputerControl.assert_not_called()
             self.control.calibrate.assert_not_called()
             self.control.click.assert_not_called()
             self.assertEqual(self.window.queue_list.count(), 2)
+
+        def test_registration_accepts_source_change_on_same_player_page(self):
+            self.pending_metadata(1, 60)
+            self.reader.find_player_center.side_effect = [
+                PlayerTarget(self.target.position, "video-a", "blob:https://lms.example/first"),
+                PlayerTarget(self.target.position, "video-b", "blob:https://lms.example/second"),
+            ]
+            self.automation.tick()
+            self.assertEqual(len(self.automation.queue), 1)
+            self.assertEqual(self.automation.state, "waiting_list")
+            self.control.click.assert_not_called()
 
         def test_no_selected_lecture_does_not_register(self):
             self.automation._set_state("registering")
@@ -752,17 +763,38 @@ def run_workflow_checks():
             self.control.click.assert_not_called()
             self.assertEqual(self.automation.phase, "watching")
 
-        def test_uncertain_video_targets_stop_without_input(self):
-            for target in (None, PlayerTarget(self.target.position, self.target.video_id,
-                                             "https://media.example/other.mp4")):
-                with self.subTest(target=target):
-                    self.automation.queue.clear()
-                    self.prepare_video_start()
-                    self.reader.find_player_center.return_value = target
-                    self.automation.tick()
-                    self.control.click.assert_not_called()
-                    self.assertEqual(self.automation.state, "stopped")
-                    self.assertEqual(len(self.automation.queue), 1)
+        def test_same_player_page_accepts_changed_video_id_source_and_duration(self):
+            self.prepare_video_start()
+            self.reader.find_player_center.side_effect = [
+                PlayerTarget(self.target.position, "video-a", "blob:https://lms.example/first"),
+                PlayerTarget(self.target.position, "video-b", "blob:https://lms.example/second"),
+                PlayerTarget(self.target.position, "video-c", "blob:https://lms.example/third"),
+            ]
+            workflow.read_video_state.return_value = VideoState(62, 0, True, False, 4)
+            self.automation.tick()
+            self.control.click.assert_called_once_with(*self.target.position.center)
+            self.assertEqual(self.automation.phase, "starting")
+            workflow.read_video_state.return_value = VideoState(62, 1, False, False, 4)
+            self.automation.tick()
+            self.assertEqual(self.automation.state, "playing")
+            self.assertEqual(self.automation.phase, "watching")
+            self.assertEqual(self.automation.wait_until, 1240)
+            self.control.click.assert_called_once()
+
+        def test_missing_player_center_stops_without_input(self):
+            self.prepare_video_start()
+            self.reader.find_player_center.return_value = None
+            self.automation.tick()
+            self.control.click.assert_not_called()
+            self.assertEqual(self.automation.state, "stopped")
+            self.assertEqual(len(self.automation.queue), 1)
+
+        def test_player_center_disappearing_before_click_stops_without_input(self):
+            self.prepare_video_start()
+            self.reader.find_player_center.side_effect = [self.target, None]
+            self.automation.tick()
+            self.control.click.assert_not_called()
+            self.assertEqual(self.automation.state, "stopped")
 
         def test_center_changing_before_click_stops_without_input(self):
             self.prepare_video_start()
@@ -797,7 +829,17 @@ def run_workflow_checks():
 
         def test_wrong_player_page_stops_without_input(self):
             self.prepare_video_start()
+            self.reader.page_snapshot.return_value = PageSnapshot(
+                "https://lms.example/player/other", True, 0, 0, 1200, 900, 1180, 800, 1)
+            self.automation.tick()
+            self.control.click.assert_not_called()
+            self.assertEqual(self.automation.state, "stopped")
+
+        def test_wrong_player_page_during_playback_confirmation_stops(self):
+            self.prepare_video_start()
+            self.automation.phase = "starting"
             self.reader.page_snapshot.return_value = self.list_snapshot
+            workflow.read_video_state.return_value = VideoState(60, 1, False, False, 4)
             self.automation.tick()
             self.control.click.assert_not_called()
             self.assertEqual(self.automation.state, "stopped")
