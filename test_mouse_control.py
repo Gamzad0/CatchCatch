@@ -113,7 +113,7 @@ def run_workflow_checks():
     import os
     import unittest
     from types import SimpleNamespace
-    from unittest.mock import Mock, patch
+    from unittest.mock import Mock, call, patch
 
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication
@@ -126,6 +126,53 @@ def run_workflow_checks():
     import computer_control as desktop
 
     app = QApplication.instance() or QApplication([])
+
+    class BackInputChecks(unittest.TestCase):
+        def setUp(self):
+            self.api = Mock(spec_set=['MapVirtualKey', 'keybd_event'])
+            self.api.MapVirtualKey.side_effect = lambda key, mode: {0x12: 0x38, 0x25: 0x4b}[key]
+            self.native_error = type('NativeError', (Exception,), {})
+            self.constants = SimpleNamespace(
+                VK_MENU=0x12, VK_LEFT=0x25, KEYEVENTF_EXTENDEDKEY=1, KEYEVENTF_KEYUP=2)
+            patches = [
+                patch.dict(sys.modules, {
+                    'win32api': self.api, 'win32con': self.constants,
+                    'pywintypes': SimpleNamespace(error=self.native_error),
+                }),
+                patch.object(desktop.sys, 'platform', 'win32'),
+                patch.object(desktop.pyautogui, 'failSafeCheck'),
+                patch.object(desktop.pyautogui, 'hotkey'),
+            ]
+            started = [item.start() for item in patches]
+            for item in patches:
+                self.addCleanup(item.stop)
+            self.failsafe, self.hotkey = started[-2:]
+            self.control = ComputerControl()
+
+        def test_windows_back_uses_extended_arrow_and_nonzero_scan_codes(self):
+            self.control.go_back()
+            self.assertEqual(self.api.keybd_event.call_args_list, [
+                call(0x12, 0x38, 0, 0),
+                call(0x25, 0x4b, 1, 0),
+                call(0x25, 0x4b, 3, 0),
+                call(0x12, 0x38, 2, 0),
+            ])
+            self.failsafe.assert_called_once_with()
+            self.hotkey.assert_not_called()
+
+        def test_failed_arrow_input_releases_both_keys_and_reports_failure(self):
+            self.api.keybd_event.side_effect = [None, self.native_error('input failed'), None, None]
+            with self.assertRaisesRegex(RuntimeError, '뒤로 가기 키 입력 실패'):
+                self.control.go_back()
+            self.assertEqual(self.api.keybd_event.call_args_list[-2:], [
+                call(0x25, 0x4b, 3, 0), call(0x12, 0x38, 2, 0),
+            ])
+
+        def test_failsafe_prevents_native_input(self):
+            self.failsafe.side_effect = pyautogui.FailSafeException('failsafe')
+            with self.assertRaises(pyautogui.FailSafeException):
+                self.control.go_back()
+            self.api.keybd_event.assert_not_called()
 
     class WindowLayoutChecks(unittest.TestCase):
         def setUp(self):
@@ -1117,6 +1164,7 @@ def run_workflow_checks():
             self.assertEqual(captures[0]['identity']['selector'], '#play')
 
     suite = unittest.TestSuite([
+        unittest.defaultTestLoader.loadTestsFromTestCase(BackInputChecks),
         unittest.defaultTestLoader.loadTestsFromTestCase(WindowLayoutChecks),
         unittest.defaultTestLoader.loadTestsFromTestCase(CalibrationLayoutChecks),
         unittest.defaultTestLoader.loadTestsFromTestCase(WorkflowChecks),

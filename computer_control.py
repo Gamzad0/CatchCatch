@@ -182,7 +182,32 @@ class ComputerControl:
 
     def go_back(self):
         """Return from a verified same-tab player using real keyboard input."""
-        pyautogui.hotkey('alt', 'left')
+        if sys.platform != 'win32':
+            pyautogui.hotkey('alt', 'left')
+            return
+        pyautogui.failSafeCheck()
+        try:
+            import win32api
+            import win32con
+            import pywintypes
+        except ImportError as error:
+            raise RuntimeError('뒤로 가기 입력에 필요한 pywin32를 찾을 수 없습니다.') from error
+        try:
+            alt_scan = win32api.MapVirtualKey(win32con.VK_MENU, 0)
+            left_scan = win32api.MapVirtualKey(win32con.VK_LEFT, 0)
+            # Distinguish the navigation arrow from its numeric-keypad counterpart.
+            extended = win32con.KEYEVENTF_EXTENDEDKEY
+            released = win32con.KEYEVENTF_KEYUP
+            try:
+                win32api.keybd_event(win32con.VK_MENU, alt_scan, 0, 0)
+                try:
+                    win32api.keybd_event(win32con.VK_LEFT, left_scan, extended, 0)
+                finally:
+                    win32api.keybd_event(win32con.VK_LEFT, left_scan, extended | released, 0)
+            finally:
+                win32api.keybd_event(win32con.VK_MENU, alt_scan, released, 0)
+        except pywintypes.error as error:
+            raise RuntimeError(f'뒤로 가기 키 입력 실패: {error}') from error
 
     def close_player(self):
         """Close only a verified foreground player tab/window."""
