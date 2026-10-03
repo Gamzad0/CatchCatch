@@ -102,7 +102,9 @@ class WindowLayout:
             actual = {}
             for handle in self.targets:
                 if (not self.gui.IsWindow(handle) or not self.gui.IsWindowVisible(handle)
-                        or self.gui.IsIconic(handle) or self.gui.IsZoomed(handle)):
+                        or self.gui.IsIconic(handle)
+                        or self.gui.GetWindowPlacement(handle)[1]
+                        == self.constants.SW_SHOWMAXIMIZED):
                     self.previous = None
                     return False
                 actual[handle] = self.gui.GetWindowRect(handle)

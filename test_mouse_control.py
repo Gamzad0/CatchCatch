@@ -129,11 +129,16 @@ def run_workflow_checks():
 
     class WindowLayoutChecks(unittest.TestCase):
         def setUp(self):
-            self.gui = Mock()
+            self.gui = Mock(spec_set=[
+                'IsWindow', 'IsWindowVisible', 'IsIconic', 'GetWindowPlacement',
+                'GetWindowRect', 'GetClassName', 'GetWindowText', 'EnumWindows',
+                'ShowWindow', 'SetWindowPos',
+            ])
             self.gui.IsWindow.return_value = True
             self.gui.IsWindowVisible.return_value = True
             self.gui.IsIconic.return_value = False
-            self.gui.IsZoomed.return_value = False
+            self.gui.GetWindowPlacement.return_value = (
+                0, 1, (0, 0), (0, 0), (0, 40, 1919, 1080))
             self.gui.GetClassName.return_value = 'Chrome_WidgetWin_1'
             self.gui.GetWindowText.return_value = 'CatchCatch 좌표 보정 - Google Chrome'
             self.gui.EnumWindows.side_effect = lambda callback, data: callback(22, data)
@@ -142,7 +147,7 @@ def run_workflow_checks():
             self.api.GetMonitorInfo.return_value = {'Work': (0, 40, 1919, 1080)}
             self.constants = SimpleNamespace(
                 MONITOR_DEFAULTTOPRIMARY=1, SW_RESTORE=9, HWND_TOP=0,
-                SWP_NOACTIVATE=16, SWP_SHOWWINDOW=64)
+                SWP_NOACTIVATE=16, SWP_SHOWWINDOW=64, SW_SHOWMAXIMIZED=3)
             class NativeError(Exception):
                 pass
             self.modules = patch.dict(sys.modules, {
@@ -171,7 +176,8 @@ def run_workflow_checks():
             self.assertFalse(layout.ready())
             self.assertFalse(layout.ready())
             self.gui.GetWindowRect.return_value = layout.targets[11]
-            self.gui.IsZoomed.return_value = True
+            self.gui.GetWindowPlacement.return_value = (
+                0, self.constants.SW_SHOWMAXIMIZED, (0, 0), (0, 0), layout.targets[11])
             self.assertFalse(layout.ready())
 
         def test_ambiguous_chrome_window_is_rejected_before_movement(self):
