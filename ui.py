@@ -28,6 +28,7 @@ class _StatusLabel(QLabel):
 
 class MainWindow(QWidget):
     queue_wait_changed = Signal(int, int)
+    review_visibility_changed = Signal(bool)
     _STEP_NAMES = ("브라우저 연결", "좌표 보정", "강의 등록", "목록 확인", "자동 재생")
 
     def __init__(self):
@@ -37,6 +38,7 @@ class MainWindow(QWidget):
         self._step = 0
         self._state = "idle"
         self._has_queue = False
+        self._playback_ready = False
         self._browser_connected = False
         self._calibration_ready = False
         self._queue_entries = []
@@ -55,7 +57,6 @@ class MainWindow(QWidget):
         self.next_button = QPushButton("다음")
         self.review_button = QPushButton("등록 완료")
         self.add_lectures_button = QPushButton("강의 추가")
-        self.recovery_button = QPushButton("연결·보정 확인")
         self.new_registration_button = QPushButton("새 강의 등록")
         self.browser_status = _StatusLabel("브라우저를 연결하면 보정 화면이 열립니다.")
         self.calibration_status = QLabel("브라우저 연결 후 보정이 자동으로 시작됩니다.")
@@ -63,6 +64,7 @@ class MainWindow(QWidget):
         self.registration_status = _StatusLabel("영상 등록 대기")
         self.playback_status = _StatusLabel("자동 재생 대기")
         self.review_status = QLabel("등록 순서와 총 대기 시간을 확인하세요.")
+        self.playback_readiness_status = QLabel("강의 목록을 확인하는 중입니다…")
         self.registration_count = QLabel("등록된 강의: 0개")
         self.latest_registration = QLabel("아직 등록된 강의가 없습니다.")
         self.playback_current = QLabel("재생할 강의가 없습니다.")
@@ -97,6 +99,7 @@ class MainWindow(QWidget):
             self.registration_status,
             self.playback_status,
             self.review_status,
+            self.playback_readiness_status,
             self.registration_count,
             self.latest_registration,
             self.playback_current,
@@ -140,14 +143,14 @@ class MainWindow(QWidget):
         )
         registration_page.addStretch()
         review_page = self._page_layout(
-            self.queue_summary, self.queue_order_instructions, self.queue_list, self.review_status
+            self.queue_summary, self.queue_order_instructions, self.queue_list,
+            self.playback_readiness_status, self.review_status,
         )
         queue_actions = QHBoxLayout()
         queue_actions.addWidget(self.add_lectures_button)
         queue_actions.addWidget(self.clear_queue_button)
         queue_actions.addStretch()
         review_page.addLayout(queue_actions)
-        review_page.addWidget(self.recovery_button)
         playback_page = self._page_layout(
             self.playback_current, self.playback_progress, self.playback_status
         )
@@ -211,7 +214,6 @@ class MainWindow(QWidget):
         self.next_button.clicked.connect(lambda: self._show_step(2))
         self.review_button.clicked.connect(self._review_queue)
         self.add_lectures_button.clicked.connect(lambda: self._show_step(2))
-        self.recovery_button.clicked.connect(self._show_setup)
         self.new_registration_button.clicked.connect(self._show_registration)
         self.browser_button.clicked.connect(self._connection_requested)
         self.calibrate_button.clicked.connect(self._calibration_requested)
@@ -241,7 +243,10 @@ class MainWindow(QWidget):
     def _show_step(self, step: int) -> None:
         if self._state == "playing" and step != 4:
             return
+        previous_step = self._step
         self._step = step
+        if previous_step != step:
+            self._playback_ready = False
         self.pages.setCurrentIndex(step)
         self.help_pages.setCurrentIndex(step)
         self.help_toggle.setChecked(False)
@@ -262,6 +267,8 @@ class MainWindow(QWidget):
             else:
                 label.setStyleSheet("padding: 8px 4px; border-bottom: 2px solid #b5b5b5;")
         self._update_step_controls()
+        if (previous_step == 3) != (step == 3):
+            self.review_visibility_changed.emit(step == 3)
 
     def _update_step_controls(self) -> None:
         registering = self._state in {"registering", "waiting_list", "pending_player"}
@@ -278,13 +285,24 @@ class MainWindow(QWidget):
         )
         self.finish_registration_button.setVisible(self._step == 3 and registering)
         self.start_button.setVisible(self._step == 3 and not registering)
+        can_start = (
+            self._step == 3 and self._has_queue and self._playback_ready
+            and self._browser_connected and self._calibration_ready
+        )
+        self.finish_registration_button.setEnabled(
+            can_start and self._state in {"registering", "waiting_list"}
+        )
+        self.start_button.setEnabled(can_start and self._state in {"idle", "stopped"})
         self.stop_button.setVisible(active)
         self.add_lectures_button.setEnabled(self._state != "playing")
-        self.recovery_button.setVisible(not active)
-        self.recovery_button.setEnabled(not active)
-        self.recovery_button.setToolTip("등록 또는 재생 중에는 먼저 중지하세요.")
         self.clear_queue_button.setToolTip("등록 중에는 먼저 중지한 뒤 목록을 비우세요.")
         self.new_registration_button.setVisible(self._step == 4 and not active)
+
+    def set_playback_ready(self, ready: bool, message: str) -> None:
+        """Only the controller's page observation may enable a start action."""
+        self._playback_ready = ready
+        self.playback_readiness_status.setText(message)
+        self._update_step_controls()
 
     def _go_back(self) -> None:
         if self.back_button.isEnabled():
@@ -293,7 +311,7 @@ class MainWindow(QWidget):
     def _review_queue(self) -> None:
         if not self.review_button.isEnabled():
             return
-        self.review_status.setText("브라우저를 강의 목록으로 돌려놓은 뒤 자동 재생을 시작하세요.")
+        self.review_status.setText("총 대기 시간은 영상별로 수정할 수 있습니다.")
         # Navigation only: the controller's finish action also starts playback,
         # so its existing signal belongs to the explicit start button in step 4.
         self._show_step(3)
@@ -427,6 +445,8 @@ class MainWindow(QWidget):
         previous_state = self._state
         self._state = state
         self._has_queue = has_queue
+        self._playback_ready = False
+        self.playback_readiness_status.setText("강의 목록을 확인하는 중입니다…")
         self._queue_editable = not playing
         for wait_input in self.queue_wait_inputs:
             wait_input.setEnabled(self._queue_editable)
@@ -435,10 +455,6 @@ class MainWindow(QWidget):
         self.coordinate_test_button.setEnabled(not active)
         self.calibrate_button.setEnabled(not active)
         self.register_button.setEnabled(ready)
-        self.finish_registration_button.setEnabled(
-            registering and state != "pending_player" and has_queue
-        )
-        self.start_button.setEnabled(ready and has_queue)
         self.stop_button.setEnabled(active)
         self.clear_queue_button.setEnabled(ready and has_queue)
         if playing:

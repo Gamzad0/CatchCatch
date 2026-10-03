@@ -346,13 +346,89 @@ class LectureAutomation(QObject):
         self.timer = QTimer(self)
         self.timer.setInterval(50)
         self.timer.timeout.connect(self.tick)
+        self._review_visible = False
+        self._review_revision = 0
+        self._starting_from_review = False
+        self.readiness_timer = QTimer(self)
+        self.readiness_timer.setInterval(500)
+        self.readiness_timer.timeout.connect(self._check_playback_readiness)
+        window.review_visibility_changed.connect(self._review_visibility_changed)
         window.register_button.clicked.connect(self.begin_registration)
-        window.finish_registration_button.clicked.connect(self.finish_registration)
-        window.start_button.clicked.connect(self.start_playback)
+        window.finish_registration_button.clicked.connect(
+            lambda: self._start_from_review(self.finish_registration)
+        )
+        window.start_button.clicked.connect(lambda: self._start_from_review(self.start_playback))
         window.stop_button.clicked.connect(self.stop)
         window.clear_queue_button.clicked.connect(self.clear_queue)
         window.queue_wait_changed.connect(self.set_queue_wait)
         connection.socket.disconnected.connect(self.stop)
+
+    def _review_visibility_changed(self, visible):
+        self._review_visible = visible
+        self._review_revision += 1
+        self.readiness_timer.stop()
+        self.window.set_playback_ready(False, "강의 목록을 확인하는 중입니다…")
+        if visible and not self._starting_from_review:
+            self.readiness_timer.start()
+            QTimer.singleShot(0, self._check_playback_readiness)
+
+    def _check_playback_readiness(self):
+        if not self._review_visible or self._starting_from_review:
+            return
+        self.window.set_playback_ready(False, "강의 목록을 확인하는 중입니다…")
+        if not self.queue:
+            self.window.set_playback_ready(False, "먼저 시청할 강의를 등록하세요.")
+            return
+        if (not self.connection.endpoint or self.connection.socket.state()
+                != QAbstractSocket.SocketState.ConnectedState):
+            self.window.set_playback_ready(False, "브라우저 연결이 끊겼습니다. 다시 연결하세요.")
+            return
+        reader = self.inspector.reader
+        if reader is None or self.inspector.calibration_geometry is None:
+            self.window.set_playback_ready(False, "먼저 브라우저 좌표를 보정하세요.")
+            return
+        if self.busy or self.inspector.busy:
+            return
+        generation = self.generation
+        revision = self._review_revision
+        item = self.queue[0]
+        self.busy = True
+        try:
+            _ = self.inspector.control.offset  # Require a valid coordinate calibration.
+            snapshot = reader.page_snapshot()
+            # Foreground focus is checked by the existing input flow. Clicking
+            # the application's start button necessarily moves focus to the app.
+            ready = False
+            if snapshot.url != item.list_url:
+                message = "브라우저를 등록한 강의 목록으로 돌려놓으세요."
+            elif (snapshot.geometry != item.list_geometry or
+                  snapshot.geometry != self.inspector.calibration_geometry):
+                message = "브라우저 위치·크기 또는 배율이 바뀌었습니다. 다시 보정하고 등록하세요."
+            else:
+                ready = True
+                message = "강의 목록 확인 완료. 자동 재생을 시작할 수 있습니다."
+        except (BrowserReaderError, RuntimeError, ValueError, OSError):
+            ready = False
+            message = "페이지 상태를 확인하지 못했습니다. 강의 목록을 열어주세요."
+        finally:
+            self.busy = False
+        # A stop, disconnect or screen change can happen inside the CDP event
+        # loop. Do not publish a result from the old page or review session.
+        if (self._review_visible and generation == self.generation and
+                revision == self._review_revision and reader is self.inspector.reader):
+            self.window.set_playback_ready(ready, message)
+
+    def _start_from_review(self, action):
+        """Keep the readiness poll out of the original start handlers' CDP calls."""
+        self._starting_from_review = True
+        self.readiness_timer.stop()
+        self.window.set_playback_ready(False, "자동 재생 시작 조건을 확인하는 중입니다…")
+        try:
+            action()
+        finally:
+            self._starting_from_review = False
+            if self._review_visible:
+                self.readiness_timer.start()
 
     def _guard(self, generation):
         if generation != self.generation or self.state in {"idle", "stopped"}:
