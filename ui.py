@@ -210,7 +210,7 @@ class MainWindow(QWidget):
             title, message = "등록한 강의", self._readiness_message
         else:
             title = "강의를 등록하세요"
-            message = "LMS 강의 목록을 열고 ‘강의 등록’을 누르세요."
+            message = "LMS의 원하는 과목에서 'n주차' 옆 '자세히 보기' 클릭 후 ‘강의 등록’을 누르세요."
         self.action_title.setText(title)
         self.action_hint.setText(message)
 
