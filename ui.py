@@ -206,6 +206,8 @@ class MainWindow(QWidget):
             font = button.font()
             font.setBold(True)
             button.setFont(font)
+        for button in (self.browser_button, self.back_button, self.next_button):
+            button.setFixedSize(160, 48)
         layout.addLayout(actions)
 
         self.help_toggle.toggled.connect(self.help_pages.setVisible)
