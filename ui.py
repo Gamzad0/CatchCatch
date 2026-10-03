@@ -1,16 +1,21 @@
 from collections.abc import Iterable
 
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListWidget,
+    QListWidgetItem,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
 
 class MainWindow(QWidget):
+    queue_wait_changed = Signal(int, int)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CatchCatch")
@@ -38,7 +43,8 @@ class MainWindow(QWidget):
         self.registration_instructions = QLabel(
             "영상 등록: LMS 강의 목록에서 시청할 항목을 클릭하세요. "
             "같은 탭에서 재생 페이지와 영상 정보가 준비되면 자동으로 등록합니다. "
-            "등록 완료 안내를 확인하세요. 영상 길이에 3분을 더해 순서대로 대기합니다. "
+            "등록 완료 안내를 확인하세요. 총 대기 시간은 등록 목록에서 영상별로 직접 수정할 수 있습니다. "
+            "기본값은 영상 길이 + 180초이며, 재생 시작 확인부터 다음 영상 전환까지의 시간입니다. "
             "직접 강의 목록으로 돌아가 다음 영상을 같은 방법으로 등록하세요. "
             "모든 영상을 등록한 뒤 강의 목록으로 돌아와 '등록 완료 · 자동 재생'을 누르세요.\n"
             "등록 정보는 앱 실행 중 메모리에 보관합니다. "
@@ -52,6 +58,8 @@ class MainWindow(QWidget):
         self.playback_status.setWordWrap(True)
         self.queue_summary = QLabel("등록된 영상: 0개 · 등록 순서대로 재생")
         self.queue_list = QListWidget()
+        self.queue_wait_inputs = []
+        self._queue_editable = True
 
         layout = QVBoxLayout(self)
         buttons = QHBoxLayout()
@@ -78,11 +86,34 @@ class MainWindow(QWidget):
         layout.addWidget(self.playback_status)
         self.set_workflow_state("idle", has_queue=False)
 
-    def set_queue(self, entries: Iterable[str]) -> None:
-        """Show caller-formatted labels, durations, wait times and queue states."""
+    def set_queue(self, entries: Iterable[tuple[str, int]]) -> None:
+        """Show each label beside its total wait editor, in seconds."""
         items = list(entries)
         self.queue_list.clear()
-        self.queue_list.addItems(items)
+        self.queue_wait_inputs.clear()
+        for index, (text, wait_seconds) in enumerate(items):
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(6, 4, 6, 4)
+            label = QLabel(text)
+            label.setWordWrap(True)
+            row_layout.addWidget(label, 1)
+            row_layout.addWidget(QLabel("총 대기"))
+            wait_input = QSpinBox()
+            wait_input.setRange(1, 2147483647)
+            wait_input.setSuffix("초")
+            wait_input.setValue(wait_seconds)
+            wait_input.setAccessibleName(f"{index + 1}번째 영상 총 대기 시간(초)")
+            wait_input.setToolTip("재생 시작 확인부터 다음 영상 전환까지의 총 대기 시간(초)")
+            wait_input.setEnabled(self._queue_editable)
+            wait_input.valueChanged.connect(
+                lambda value, row_index=index: self.queue_wait_changed.emit(row_index, value)
+            )
+            row_layout.addWidget(wait_input)
+            item = QListWidgetItem(self.queue_list)
+            item.setSizeHint(row.sizeHint())
+            self.queue_list.setItemWidget(item, row)
+            self.queue_wait_inputs.append(wait_input)
         self.queue_summary.setText(
             f"등록된 영상: {len(items)}개 · 등록 순서대로 재생"
         )
@@ -93,6 +124,9 @@ class MainWindow(QWidget):
         playing = state == "playing"
         active = registering or playing
         ready = state in {"idle", "stopped"}
+        self._queue_editable = not playing
+        for wait_input in self.queue_wait_inputs:
+            wait_input.setEnabled(self._queue_editable)
 
         self.browser_button.setEnabled(not active)
         self.coordinate_test_button.setEnabled(not active)

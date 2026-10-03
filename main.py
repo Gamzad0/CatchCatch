@@ -5,8 +5,9 @@ import json
 import math
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, build_opener
 
@@ -261,9 +262,12 @@ class RegisteredLecture:
     player_control: ComputerControl
     duration: float
     navigation: str
+    custom_wait_seconds: Optional[int] = None
 
     @property
     def wait_seconds(self):
+        if self.custom_wait_seconds is not None:
+            return self.custom_wait_seconds
         return self.duration + 180.0
 
 
@@ -332,6 +336,7 @@ class LectureAutomation(QObject):
         window.start_button.clicked.connect(self.start_playback)
         window.stop_button.clicked.connect(self.stop)
         window.clear_queue_button.clicked.connect(self.clear_queue)
+        window.queue_wait_changed.connect(self.set_queue_wait)
         connection.socket.disconnected.connect(self.stop)
 
     def _guard(self, generation):
@@ -354,10 +359,16 @@ class LectureAutomation(QObject):
 
     def _show_queue(self):
         self.window.set_queue([
-            f"{index}. {item.identity.label or item.identity.tag} · "
-            f"영상 {math.ceil(item.duration)}초 · 대기 {math.ceil(item.wait_seconds)}초 (+3분)"
+            (f"{index}. {item.identity.label or item.identity.tag} · "
+             f"영상 {math.ceil(item.duration)}초", math.ceil(item.wait_seconds))
             for index, item in enumerate(self.queue, 1)
         ])
+
+    def set_queue_wait(self, index: int, wait_seconds: int) -> None:
+        """Keep each edited total wait in memory without rebuilding its editor."""
+        if self.state == "playing" or not 0 <= index < len(self.queue) or wait_seconds < 1:
+            return
+        self.queue[index] = replace(self.queue[index], custom_wait_seconds=wait_seconds)
 
     def _prepare(self):
         if self.busy:
@@ -576,7 +587,8 @@ class LectureAutomation(QObject):
         self._show_queue()
         self._set_state("waiting_list")
         self.window.registration_status.setText(
-            f"등록 완료: 영상 {math.ceil(item.duration)}초 + 안전 마진 180초. "
+            f"등록 완료: 영상 {math.ceil(item.duration)}초 · 총 대기 {math.ceil(item.wait_seconds)}초. "
+            "등록 목록에서 대기 시간을 수정할 수 있습니다. "
             "직접 재생창에서 강의 목록으로 돌아가 다음 영상을 선택하세요.")
 
     def _release_player(self):

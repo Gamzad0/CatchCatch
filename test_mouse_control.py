@@ -417,6 +417,71 @@ def run_workflow_checks():
             self.assertEqual(self.automation.state, "waiting_list")
             self.control.click.assert_not_called()
 
+        def test_custom_total_wait_starts_after_playback_confirmation(self):
+            self.pending_metadata(1, 60)
+            self.automation.tick()
+            self.window.queue_wait_inputs[0].setValue(300)
+            self.assertEqual(self.automation.queue[0].wait_seconds, 300)
+            self.automation._set_state("playing")
+            self.automation.phase = "starting"
+            self.automation.deadline = 1030
+            self.automation.tick()  # Still paused: no timer yet.
+            self.assertEqual(self.automation.phase, "starting")
+            self.assertEqual(self.automation.wait_until, 0)
+            workflow.read_video_state.return_value = VideoState(60, 0, False, False, 4)
+            self.automation.tick()
+            self.assertEqual(self.automation.wait_until, 1300)
+            self.assertEqual(self.automation.phase, "watching")
+            workflow.time.monotonic.return_value = 1299
+            self.automation.tick()
+            self.assertEqual(self.automation.phase, "watching")
+            workflow.time.monotonic.return_value = 1300
+            self.automation.tick()
+            self.assertEqual(self.automation.phase, "return")
+            self.control.go_back.assert_not_called()
+
+        def test_custom_total_wait_applies_to_already_playing_video(self):
+            self.pending_metadata(1, 60)
+            self.automation.tick()
+            self.window.queue_wait_inputs[0].setValue(300)
+            self.automation._set_state("playing")
+            self.automation.phase = "opening"
+            self.automation.deadline = 1030
+            workflow.read_video_state.return_value = VideoState(60, 0, False, False, 4)
+            self.automation.tick()
+            self.assertEqual(self.automation.wait_until, 1300)
+            self.assertEqual(self.automation.phase, "watching")
+            self.control.click.assert_not_called()
+
+        def test_wait_edits_survive_queue_advance_and_stop(self):
+            self.pending_metadata(1, 60)
+            self.automation.tick()
+            self.pending_metadata(2, 90)
+            self.automation.tick()
+            self.window.queue_wait_inputs[1].setValue(400)
+            self.assertEqual([item.wait_seconds for item in self.automation.queue], [240, 400])
+            self.automation._set_state("playing")
+            self.assertFalse(self.window.queue_wait_inputs[1].isEnabled())
+            self.automation.set_queue_wait(1, 500)
+            self.assertEqual(self.automation.queue[1].wait_seconds, 400)
+            self.automation.phase = "returning"
+            self.reader.page_snapshot.return_value = self.list_snapshot
+            self.automation.tick()
+            self.assertEqual(self.window.queue_wait_inputs[0].value(), 400)
+            self.assertFalse(self.window.queue_wait_inputs[0].isEnabled())
+            self.automation.stop()
+            self.assertTrue(self.window.queue_wait_inputs[0].isEnabled())
+            self.window.queue_wait_inputs[0].setValue(450)
+            self.assertEqual(self.automation.queue[0].identity, self.identity(2))
+            self.assertEqual(self.automation.queue[0].wait_seconds, 450)
+            self.automation.start_playback()
+            self.assertEqual(self.automation.queue[0].wait_seconds, 450)
+            self.assertFalse(self.window.queue_wait_inputs[0].isEnabled())
+            self.automation.stop()
+            self.automation.clear_queue()
+            self.assertFalse(self.automation.queue)
+            self.assertEqual(self.window.queue_wait_inputs, [])
+
         def test_no_selected_lecture_does_not_register(self):
             self.automation._set_state("registering")
             self.automation.tick()
