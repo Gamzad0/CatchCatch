@@ -4,13 +4,14 @@ Create a QCoreApplication (or QApplication) before BrowserReader. Pass the
 chosen tab's webSocketDebuggerUrl from the browser's /json/list endpoint.
 Use this object only from the Qt thread that created it. No UI is required.
 Frames and shadow roots are intentionally not traversed.
-The one page operation is the explicitly requested registered-item scroll.
+CDP reads DOM state and observes the user's normal list clicks.
+The user-authorized registered-item scroll is the sole page operation.
 """
 
 import json
 import math
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Optional
 from uuid import uuid4
 
@@ -21,6 +22,13 @@ from PySide6.QtWebSockets import QWebSocket
 
 class BrowserReaderError(RuntimeError):
     """Connection, JavaScript, or ambiguous element lookup failure."""
+
+    @property
+    def during_navigation(self):
+        """Only known context teardown errors may be retried without input."""
+        return any(message in str(self) for message in (
+            'Execution context was destroyed', 'Cannot find context with specified id',
+            'Cannot find default execution context'))
 
 
 @dataclass(frozen=True)
@@ -55,10 +63,16 @@ class ClickedElement:
 
 
 @dataclass(frozen=True)
-class VideoCapture:
-    web_x: float
-    web_y: float
-    duration: float
+class PlayerTarget:
+    """Current visible player center and actual video identity, in memory only."""
+
+    position: ElementPosition
+    video_id: str
+    source: str = field(repr=False)
+
+    @property
+    def identity(self):
+        return self.video_id, self.source
 
 
 @dataclass(frozen=True)
@@ -193,23 +207,6 @@ function lectureVideo() {
 }
 """
 
-_VIDEO_POINT_HELPER = _VIDEO_ELEMENT_HELPER + r"""
-function videoPointIsVisible(x, y) {
-    const video = lectureVideo();
-    if (!video) return false;
-    const rect = video.getBoundingClientRect();
-    const style = getComputedStyle(video);
-    if (style.visibility !== 'visible' || Number(style.opacity) === 0 ||
-        rect.width <= 0 || rect.height <= 0 || x < rect.left || x >= rect.right ||
-        y < rect.top || y >= rect.bottom || x < 0 || y < 0 ||
-        x >= innerWidth || y >= innerHeight) return false;
-    const hit = document.elementFromPoint(x, y);
-    const player = video.closest('.video-js');
-    return !!hit && (hit === video || video.contains(hit) ||
-        (!!player && player.contains(hit)));
-}
-"""
-
 
 class BrowserReader:
     """Synchronous, bounded CDP queries for one explicitly selected tab."""
@@ -233,7 +230,6 @@ class BrowserReader:
         self._observation_mode = None
         self._observation_error = None
         self._clicks = deque()
-        self._video_captures = deque()
         self._socket.textMessageReceived.connect(self._observe_message)
 
     def _exchange(self, action, expected_signal, accept):
@@ -311,7 +307,9 @@ class BrowserReader:
         response = self._exchange(lambda: self._socket.sendTextMessage(payload),
                                   self._socket.textMessageReceived, accept)
         if 'error' in response:
-            raise BrowserReaderError('CDP rejected the DOM query')
+            reason = response['error'].get('message', '')
+            detail = reason.strip().splitlines()[0][:300] if isinstance(reason, str) and reason.strip() else ''
+            raise BrowserReaderError('CDP rejected the DOM query' + (': ' + detail if detail else ''))
         return response.get('result', {})
 
     def _evaluate(self, expression):
@@ -387,7 +385,7 @@ class BrowserReader:
         return self._position('const el = registeredElement(' + payload + ');')
 
     def scroll_registered_into_view(self, identity: ElementIdentity) -> bool:
-        """The user-requested scroll, only after an exact identity match."""
+        """Scroll only after an exact match to the registered list item."""
         payload = json.dumps(asdict(identity))
         return self._evaluate('(() => {' + _ELEMENT_HELPERS +
             'const el = registeredElement(' + payload + '); if (!el) return false;'
@@ -416,13 +414,46 @@ class BrowserReader:
             raise BrowserReaderError('Invalid browser window geometry')
         return snapshot
 
-    def video_point_is_visible(self, web_x: float, web_y: float) -> bool:
-        """Verify the saved point still hits the visible video or Video.js controls."""
-        if not math.isfinite(web_x) or not math.isfinite(web_y):
-            raise ValueError('Coordinates must be finite')
-        return self._evaluate('(() => {' + _VIDEO_POINT_HELPER +
-            'return videoPointIsVisible(' + json.dumps(web_x) + ', ' +
-            json.dumps(web_y) + ');})()') is True
+    def find_player_center(self) -> Optional[PlayerTarget]:
+        """Observe #my-video's center; never choose a button or send input."""
+        value = self._evaluate('(() => {' + _VIDEO_ELEMENT_HELPER + r'''
+            const video = lectureVideo();
+            if (!video || video.readyState < 1 || !video.currentSrc) return null;
+            const player = document.querySelector('#my-video');
+            for (let node = video; node; node = node.parentElement) {
+                const style = getComputedStyle(node);
+                if (style.display === 'none' || style.visibility !== 'visible' ||
+                    Number(style.opacity) === 0 || node.matches('[inert]')) return null;
+            }
+            const rect = player.getBoundingClientRect();
+            const videoRect = video.getBoundingClientRect();
+            const x = rect.x + rect.width / 2, y = rect.y + rect.height / 2;
+            if (rect.width <= 0 || rect.height <= 0 || x < 0 || y < 0 ||
+                x >= innerWidth || y >= innerHeight ||
+                x < videoRect.left || x >= videoRect.right ||
+                y < videoRect.top || y >= videoRect.bottom) return null;
+            const hit = document.elementFromPoint(x, y);
+            if (!hit || !player.contains(hit) ||
+                hit.closest('[inert], [aria-disabled="true"], [role="dialog"]')) return null;
+            return {position: {tag: player.tagName.toLowerCase(), x: rect.x, y: rect.y,
+                               width: rect.width, height: rect.height, label: ''},
+                    video_id: video.id, source: video.currentSrc};
+        })()''')
+        if value is None:
+            return None
+        try:
+            target = PlayerTarget(ElementPosition(**value['position']),
+                                  value['video_id'], value['source'])
+        except (KeyError, TypeError) as error:
+            raise BrowserReaderError('Invalid player target') from error
+        if (not isinstance(target.video_id, str) or not isinstance(target.source, str)
+                or not target.source or any(isinstance(number, bool) or
+                    not isinstance(number, (int, float)) or not math.isfinite(number)
+                    for number in (target.position.x, target.position.y,
+                                   target.position.width, target.position.height))
+                or min(target.position.width, target.position.height) <= 0):
+            raise BrowserReaderError('Invalid player target')
+        return target
 
     @staticmethod
     def _identity(value):
@@ -459,7 +490,7 @@ class BrowserReader:
             if payload.get('mode') != self._observation_mode:
                 return
             if payload.get('error'):
-                self._observation_error = '등록 위치를 확인할 수 없습니다. 커서를 다시 움직인 뒤 시도하세요.'
+                self._observation_error = '선택한 강의 항목을 확인할 수 없습니다. 등록을 다시 시작하세요.'
                 return
             if self._observation_mode == 'click':
                 identity = self._identity(payload['identity'])
@@ -469,16 +500,8 @@ class BrowserReader:
                            (position.x, position.y, position.width, position.height)):
                     raise ValueError('Invalid click position')
                 self._clicks.append(ClickedElement(identity, position))
-            elif self._observation_mode == 'video':
-                capture = VideoCapture(payload['web_x'], payload['web_y'], payload['duration'])
-                if (not all(isinstance(number, (int, float)) and not isinstance(number, bool)
-                            and math.isfinite(number) for number in
-                            (capture.web_x, capture.web_y, capture.duration)) or capture.duration <= 0):
-                    raise ValueError('Invalid video capture')
-                self._video_captures.append(capture)
-            if len(self._clicks) + len(self._video_captures) > 100:
+            if len(self._clicks) > 100:
                 self._clicks.clear()
-                self._video_captures.clear()
                 self._observation_error = '등록 입력이 너무 많습니다. 영상 등록을 다시 시작하세요.'
         except (KeyError, TypeError, ValueError, BrowserReaderError):
             self._observation_error = '영상 등록 입력을 확인할 수 없습니다.'
@@ -492,9 +515,8 @@ class BrowserReader:
             self._binding_installed = True
         self._observation_error = None
         self._clicks.clear()
-        self._video_captures.clear()
         self._observation_mode = mode
-        script = '(() => {' + _ELEMENT_HELPERS + _VIDEO_POINT_HELPER + r'''
+        script = '(() => {' + _ELEMENT_HELPERS + r'''
             const key = LISTENER_KEY;
             const mode = OBSERVATION_MODE;
             const send = value => window[BINDING_NAME](JSON.stringify({mode, ...value}));
@@ -506,37 +528,15 @@ class BrowserReader:
                 document.addEventListener(kind, listener, true);
                 listeners.push([kind, listener]);
             };
-            if (mode === 'click') {
-                add('click', event => {
-                    if (!event.isTrusted || event.button !== 0 || !document.hasFocus()) return;
-                    try {
-                        const el = event.target instanceof Element ? event.target : null;
-                        const position = positionOf(el);
-                        if (!position) return;
-                        send({identity: identityOf(el.closest(clickableSelector)), position});
-                    } catch (_) { send({error: true}); }
-                });
-            } else {
-                let pointer = null;
-                const moved = event => {
-                    if (event.isTrusted)
-                        pointer = {x: event.clientX, y: event.clientY, time: performance.now()};
-                };
-                add('pointermove', moved);
-                add('mousemove', moved);
-                add('keyup', event => {
-                    if (!event.isTrusted || event.code !== 'Space' || !document.hasFocus()) return;
-                    try {
-                        const video = lectureVideo();
-                        if (!video || !pointer || performance.now() - pointer.time > 30000 ||
-                            !videoPointIsVisible(pointer.x, pointer.y) ||
-                            !Number.isFinite(video.duration) || video.duration <= 0) {
-                            send({error: true}); return;
-                        }
-                        send({web_x: pointer.x, web_y: pointer.y, duration: video.duration});
-                    } catch (_) { send({error: true}); }
-                });
-            }
+            add('click', event => {
+                if (!event.isTrusted || event.button !== 0 || !document.hasFocus()) return;
+                try {
+                    const el = event.target instanceof Element ? event.target : null;
+                    const position = positionOf(el);
+                    if (!position) return;
+                    send({identity: identityOf(el.closest(clickableSelector)), position});
+                } catch (_) { send({error: true}); }
+            });
             window[key] = listeners;
             return true;
         })();'''
@@ -553,7 +553,6 @@ class BrowserReader:
         active = self._observation_mode is not None
         self._observation_mode = None
         self._clicks.clear()
-        self._video_captures.clear()
         self._observation_error = None
         if active:
             key = json.dumps(self._listener_name)
@@ -580,16 +579,3 @@ class BrowserReader:
             error, self._observation_error = self._observation_error, None
             raise BrowserReaderError(error)
         return self._clicks.popleft() if self._clicks else None
-
-    def start_video_observation(self):
-        """Observe the user's Space release and pointer at the current video."""
-        self._start_observation('video')
-
-    def stop_video_observation(self):
-        self._stop_observation()
-
-    def take_video_capture(self) -> Optional[VideoCapture]:
-        if self._observation_error:
-            error, self._observation_error = self._observation_error, None
-            raise BrowserReaderError(error)
-        return self._video_captures.popleft() if self._video_captures else None

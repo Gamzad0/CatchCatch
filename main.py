@@ -5,7 +5,7 @@ import json
 import math
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, build_opener
@@ -185,7 +185,7 @@ class RegisteredLecture:
     player_url: str
     player_geometry: tuple
     player_control: ComputerControl
-    play_point: tuple
+    video_identity: tuple = field(repr=False)
     duration: float
     navigation: str
 
@@ -385,6 +385,10 @@ class LectureAutomation(QObject):
                 self._play_tick(generation)
         except WorkflowCancelled:
             pass
+        except BrowserReaderError as error:
+            loading = self.state == "pending_player" or (self.state == "playing" and self.phase == "opening")
+            if not (loading and error.during_navigation and time.monotonic() < self.deadline):
+                self._fail(error)
         except (RuntimeError, ValueError, OSError, pyautogui.FailSafeException) as error:
             self._fail(error)
         finally:
@@ -395,7 +399,15 @@ class LectureAutomation(QObject):
         if clicked is not None:
             self._begin_player_registration(generation, clicked)
             return
-        snapshot = self._read(generation, self.list_reader.page_snapshot)
+        try:
+            snapshot = self._read(generation, self.list_reader.page_snapshot)
+        except BrowserReaderError as error:
+            if error.during_navigation:
+                clicked = self._read(generation, self.list_reader.take_clicked_identity)
+                if clicked is not None:
+                    self._begin_player_registration(generation, clicked)
+                    return
+            raise
         # The binding event can arrive while the snapshot query's event loop runs.
         clicked = self._read(generation, self.list_reader.take_clicked_identity)
         if clicked is not None:
@@ -407,80 +419,85 @@ class LectureAutomation(QObject):
 
     def _begin_player_registration(self, generation, clicked):
         self.pending = clicked.identity
-        self._read(generation, self.list_reader.stop_click_observation)
         self._set_state("pending_player")
         self.deadline = time.monotonic() + 30
+        try:
+            self._read(generation, self.list_reader.stop_click_observation)
+        except BrowserReaderError as error:
+            if not error.during_navigation:
+                raise
+        if any(item.identity == self.pending and item.list_url == self.list_url
+               for item in self.queue):
+            self.pending = None
+            self._set_state("waiting_list")
+            self.window.registration_status.setText("이미 등록한 강의입니다. 목록으로 돌아가 다음 강의를 선택하세요.")
+            return
         self.window.registration_status.setText(
-            "영상이 열리면 재생 시작 위치에 커서를 움직여 놓고 Space를 누르세요. 저장 안내까지 커서를 유지하세요.")
+            "선택한 강의의 재생 페이지와 영상 정보가 준비되면 자동으로 등록합니다.")
 
     def _locate_player(self, generation, navigation=None):
-        """Use the selected tab or exactly one newly opened, focused player."""
+        """Only the original calibrated tab is supported; new windows are deferred."""
         if self.player_reader is not None:
             return self.player_reader
+        pages = browser_pages(self.connection.endpoint)
+        self._guard(generation)
+        if navigation == "new" or set(pages) - self.baseline_pages:
+            raise RuntimeError("새 탭·창의 좌표 보정 처리는 보류 중입니다. 보정한 같은 탭에서 다시 등록하세요.")
         snapshot = self._read(generation, self.list_reader.page_snapshot)
-        if navigation != "new" and snapshot.has_focus and snapshot.url != self.list_url:
+        if snapshot.url != self.list_url:
+            self._verify_calibration(self.list_reader, snapshot)
+        if snapshot.has_focus and snapshot.url != self.list_url:
             video = self._read(generation, read_video_state, self.list_reader)
             if video is not None:
                 self.player_reader = self.list_reader
                 self.owns_player = False
                 return self.player_reader
-        if navigation == "same":
-            return None
-        pages = browser_pages(self.connection.endpoint)
-        self._guard(generation)
-        new_ids = set(pages) - self.baseline_pages
-        if len(new_ids) > 1:
-            raise RuntimeError("새 탭/창이 여러 개 열려 재생창을 특정할 수 없습니다. 중지 후 다시 등록하세요.")
-        if len(new_ids) == 1:
-            reader = BrowserReader(pages[new_ids.pop()], timeout_ms=1500)
-            try:
-                self._read(generation, reader.connect)
-                current = self._read(generation, reader.page_snapshot)
-                video = self._read(generation, read_video_state, reader)
-                if current.has_focus and video is not None:
-                    self.player_reader = reader
-                    self.owns_player = True
-                    return reader
-            except BaseException:
-                reader.close()
-                raise
-            reader.close()
         return None
 
+    def _verify_calibration(self, reader, snapshot):
+        control = self.inspector.control
+        control.offset
+        if (reader is not self.list_reader or reader is not self.inspector.reader or
+                snapshot.geometry != self.inspector.calibration_geometry or
+                snapshot.geometry != self.list_geometry or
+                snapshot.device_pixel_ratio != control.scale):
+            raise RuntimeError("현재 탭에 좌표 보정을 적용할 수 없습니다. 다시 보정하고 같은 탭에서 등록하세요.")
+
+    def _wait_for_registration(self):
+        if time.monotonic() >= self.deadline:
+            raise RuntimeError("재생 페이지·영상 메타데이터·가림 없는 플레이어를 확인하지 못했습니다. 목록에서 다시 등록하세요.")
+
     def _register_player(self, generation):
+        if self.pending is None:
+            raise RuntimeError("등록할 강의가 선택되지 않았습니다.")
         reader = self._locate_player(generation)
         if reader is None:
-            if time.monotonic() >= self.deadline:
-                raise RuntimeError("#my-video가 있는 재생창을 찾지 못했습니다. 강의 목록으로 돌아가 다시 등록하세요.")
+            self._wait_for_registration()
             return
-        if not self._read(generation, reader.observation_is_active):
-            self._read(generation, reader.start_video_observation)
-        capture = self._read(generation, reader.take_video_capture)
-        if capture is None:
-            return
-        screen_point = tuple(pyautogui.position())
         snapshot = self._read(generation, reader.page_snapshot)
-        if not snapshot.has_focus:
-            raise RuntimeError("영상 재생창을 활성화한 상태에서 Space를 눌러 등록하세요.")
-        if not self._read(generation, reader.video_point_is_visible, capture.web_x, capture.web_y):
-            raise RuntimeError("재생 시작 위치가 영상 플레이어에서 벗어났습니다.")
-        if not math.isfinite(capture.duration) or capture.duration <= 0:
+        self._verify_calibration(reader, snapshot)
+        if snapshot.url == self.list_url:
+            raise RuntimeError("선택한 강의의 재생 페이지로 전환되지 않았습니다.")
+        video = self._read(generation, read_video_state, reader)
+        target = self._read(generation, reader.find_player_center)
+        if not snapshot.has_focus or video is None or target is None:
+            self._wait_for_registration()
+            return
+        if not math.isfinite(video.duration) or video.duration <= 0:
             raise RuntimeError("영상 길이를 확인할 수 없습니다.")
-        if tuple(pyautogui.position()) != screen_point:
-            raise RuntimeError("등록 확인 중 커서가 이동했습니다. 저장 안내가 나올 때까지 시작 위치에 커서를 유지하세요.")
-        control = ComputerControl()
-        control.calibrate(capture.web_x, capture.web_y,
-                          scale=snapshot.device_pixel_ratio, screen_point=screen_point)
-        self._guard(generation)
-        item = RegisteredLecture(
-            self.pending, self.list_url, self.list_geometry, snapshot.url,
-            snapshot.geometry, control, (capture.web_x, capture.web_y),
-            capture.duration, "new" if self.owns_player else "same")
-        self._read(generation, reader.stop_video_observation)
+        fresh_target = self._read(generation, reader.find_player_center)
+        fresh_video = self._read(generation, read_video_state, reader)
         fresh = self._read(generation, reader.page_snapshot)
         self._verify_snapshot(fresh, snapshot.url, snapshot.geometry)
-        if not fresh.has_focus or tuple(pyautogui.position()) != screen_point:
-            raise RuntimeError("저장 직전에 활성 창이나 커서 위치가 바뀌었습니다. 강의 목록에서 다시 등록하세요.")
+        self._verify_calibration(reader, fresh)
+        if (not fresh.has_focus or fresh_target != target or fresh_video is None or
+                fresh_video.duration != video.duration):
+            self._wait_for_registration()
+            return
+        item = RegisteredLecture(
+            self.pending, self.list_url, self.list_geometry, snapshot.url,
+            snapshot.geometry, self.inspector.control, target.identity,
+            video.duration, "same")
         self.queue.append(item)
         self.pending = None
         self._show_queue()
@@ -527,12 +544,18 @@ class LectureAutomation(QObject):
         elif self.phase == "starting":
             snapshot = self._read(generation, self.player_reader.page_snapshot)
             self._verify_snapshot(snapshot, item.player_url, item.player_geometry)
+            self._verify_calibration(self.player_reader, snapshot)
+            target = self._read(generation, self.player_reader.find_player_center)
+            if target is None or target.identity != item.video_identity:
+                raise RuntimeError("재생 확인 중 영상 대상이 바뀌거나 플레이어가 가려졌습니다.")
             video = self._read(generation, read_video_state, self.player_reader)
-            if video is not None and video.playing:
+            if video is not None and not math.isclose(video.duration, item.duration, abs_tol=1, rel_tol=0):
+                raise RuntimeError("재생 확인 중 영상 길이가 바뀌었습니다.")
+            if snapshot.has_focus and video is not None and video.playing:
                 self.wait_until = time.monotonic() + item.wait_seconds
                 self.phase = "watching"
             elif time.monotonic() >= self.deadline:
-                raise RuntimeError("저장된 시작 위치를 클릭했지만 재생이 확인되지 않았습니다. 다시 등록하세요.")
+                raise RuntimeError("플레이어 중앙을 클릭했지만 재생이 확인되지 않았습니다. LMS의 중앙 클릭 동작을 확인하세요.")
         elif self.phase == "watching":
             remaining = max(0, math.ceil(self.wait_until - time.monotonic()))
             self.window.playback_status.setText(
@@ -557,6 +580,7 @@ class LectureAutomation(QObject):
     def _open_lecture(self, generation, item):
         snapshot = self._read(generation, self.list_reader.page_snapshot)
         self._verify_snapshot(snapshot, item.list_url, item.list_geometry)
+        self._verify_calibration(self.list_reader, snapshot)
         if not snapshot.has_focus:
             self.window.playback_status.setText("등록한 강의 목록의 Chrome 페이지를 활성화하세요.")
             return
@@ -577,6 +601,7 @@ class LectureAutomation(QObject):
         fresh = self._read(generation, self.list_reader.find_registered_clickable, item.identity)
         current = self._read(generation, self.list_reader.page_snapshot)
         self._verify_snapshot(current, item.list_url, item.list_geometry)
+        self._verify_calibration(self.list_reader, current)
         if not current.has_focus or fresh is None or fresh != target:
             raise RuntimeError("클릭 직전에 영상 항목의 위치 또는 활성 페이지가 바뀌었습니다.")
         self.list_url, self.list_geometry = item.list_url, item.list_geometry
@@ -593,41 +618,50 @@ class LectureAutomation(QObject):
             return
         snapshot = self._read(generation, reader.page_snapshot)
         self._verify_snapshot(snapshot, item.player_url, item.player_geometry)
+        self._verify_calibration(reader, snapshot)
         if not snapshot.has_focus:
             self.window.playback_status.setText("영상 재생창의 Chrome 페이지를 활성화하세요.")
             return
         video = self._read(generation, read_video_state, reader)
-        if video is None or not math.isclose(video.duration, item.duration, abs_tol=1, rel_tol=0):
+        if video is None:
+            if time.monotonic() >= self.deadline:
+                raise RuntimeError("영상 메타데이터가 준비되지 않았습니다.")
+            return
+        if not math.isclose(video.duration, item.duration, abs_tol=1, rel_tol=0):
             raise RuntimeError("등록한 영상 길이와 현재 영상이 다릅니다.")
-        if not self._read(generation, reader.video_point_is_visible, *item.play_point):
-            raise RuntimeError("저장된 재생 시작 위치가 가려졌거나 플레이어 위치가 바뀌었습니다.")
+        target = self._read(generation, reader.find_player_center)
+        if target is None or target.identity != item.video_identity:
+            raise RuntimeError("등록한 영상과 현재 대상이 다르거나 플레이어 중앙이 가려졌습니다.")
+        fresh_target = self._read(generation, reader.find_player_center)
+        fresh_video = self._read(generation, read_video_state, reader)
         fresh = self._read(generation, reader.page_snapshot)
         self._verify_snapshot(fresh, item.player_url, item.player_geometry)
-        if not fresh.has_focus:
-            raise RuntimeError("재생 직전에 활성 창이 바뀌었습니다.")
-        if video.paused:
-            self.phase = "starting"
-            self.deadline = time.monotonic() + 10
-            item.player_control.click(*item.play_point)
-        elif video.playing:
-            # Some LMS players autoplay; clicking again could pause the video.
+        self._verify_calibration(reader, fresh)
+        if (not fresh.has_focus or fresh_target != target or fresh_video is None or
+                not math.isclose(fresh_video.duration, item.duration, abs_tol=1, rel_tol=0)):
+            raise RuntimeError("재생 직전에 활성 페이지·영상·플레이어 위치가 바뀌었습니다.")
+        if fresh_video.playing:
             self.wait_until = time.monotonic() + item.wait_seconds
             self.phase = "watching"
+        elif fresh_video.paused and not fresh_video.ended:
+            self.phase = "starting"
+            self.deadline = time.monotonic() + 10
+            self.inspector.control.click(*fresh_target.position.center)
         else:
-            raise RuntimeError("현재 영상이 이미 종료된 상태입니다. 재생 시작 위치를 다시 등록하세요.")
+            raise RuntimeError("현재 영상의 재생 상태가 불확실하거나 이미 종료되었습니다.")
 
     def _return_to_list(self, generation, item):
+        if item.navigation != "same":
+            raise RuntimeError("새 탭·창 처리는 보류 중입니다. 같은 탭에서 다시 등록하세요.")
         snapshot = self._read(generation, self.player_reader.page_snapshot)
         self._verify_snapshot(snapshot, item.player_url, item.player_geometry)
+        self._verify_calibration(self.player_reader, snapshot)
         if not snapshot.has_focus:
             self.window.playback_status.setText("대기 완료. 영상 재생창을 활성화하면 강의 목록으로 돌아갑니다.")
             return
         self.phase = "returning"
         self.deadline = time.monotonic() + 30
-        if item.navigation == "new":
-            item.player_control.close_player()
-        else:
-            item.player_control.go_back()
+        self.inspector.control.go_back()
 
     def _fail(self, error):
         self.stop()
@@ -655,7 +689,6 @@ class LectureAutomation(QObject):
         for reader in {self.list_reader, self.player_reader} - {None}:
             try:
                 reader.stop_click_observation()
-                reader.stop_video_observation()
             except (RuntimeError, ValueError, OSError):
                 pass
         self._release_player()

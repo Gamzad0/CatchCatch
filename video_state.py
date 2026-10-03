@@ -32,7 +32,7 @@ def read_video_state(reader: 'BrowserReader') -> Optional[VideoState]:
 
     value = reader._evaluate('(() => {' + _VIDEO_ELEMENT_HELPER + '''
         const video = lectureVideo();
-        if (!video) return null;
+        if (!video || video.readyState < 1) return null;
         if (!Number.isFinite(video.duration) || video.duration <= 0) return null;
         return {duration: video.duration, current_time: video.currentTime,
                 paused: video.paused, ended: video.ended, ready_state: video.readyState};

@@ -119,7 +119,7 @@ def run_workflow_checks():
     from PySide6.QtWidgets import QApplication
     from PySide6.QtCore import QEvent, QEventLoop, QTimer
     from PySide6.QtWebEngineWidgets import QWebEngineView
-    from browser_reader import ClickedElement, ElementIdentity, ElementPosition, PageSnapshot, VideoCapture
+    from browser_reader import ClickedElement, ElementIdentity, ElementPosition, PageSnapshot, PlayerTarget
     from ui import MainWindow
     from video_state import VideoState, read_video_state
     import main as workflow
@@ -136,10 +136,13 @@ def run_workflow_checks():
             self.reader = Mock(spec=BrowserReader)
             self.reader.page_snapshot.return_value = self.list_snapshot
             self.reader.take_clicked_identity.return_value = None
-            self.player = Mock(spec=BrowserReader)
-            self.player.page_snapshot.return_value = self.player_snapshot
-            self.player.video_point_is_visible.return_value = True
+            self.player = self.reader  # Real LMS navigation stays in the calibrated tab.
+            self.target = PlayerTarget(ElementPosition("div", 100, 100, 600, 400),
+                                       "my-video_html5_api", "https://media.example/lecture-1.mp4")
+            self.reader.find_player_center.return_value = self.target
             self.control = Mock(spec=ComputerControl)
+            self.control.scale = 1
+            self.control.offset = (0, 100)
             inspector = SimpleNamespace(
                 reader=self.reader, control=self.control, busy=False,
                 calibration_geometry=self.list_snapshot.geometry, timer=Mock())
@@ -148,6 +151,7 @@ def run_workflow_checks():
             self.automation.list_reader = self.reader
             self.automation.list_url = self.list_snapshot.url
             self.automation.list_geometry = self.list_snapshot.geometry
+            self.automation.baseline_pages = {"list"}
             self.clock = patch.object(workflow.time, "monotonic", return_value=1000.0)
             self.clock.start()
             self.pages = patch.object(workflow, "browser_pages", return_value={"list": "unused"})
@@ -156,6 +160,9 @@ def run_workflow_checks():
             self.player_controls.start()
             self.mouse_position = patch.object(workflow.pyautogui, "position", return_value=(400, 300))
             self.mouse_position.start()
+            self.video_state = patch.object(workflow, "read_video_state",
+                                            return_value=VideoState(60, 0, True, False, 4))
+            self.video_state.start()
 
         def tearDown(self):
             self.automation.stop()
@@ -163,6 +170,7 @@ def run_workflow_checks():
             self.pages.stop()
             self.player_controls.stop()
             self.mouse_position.stop()
+            self.video_state.stop()
             self.window.close()
 
         @staticmethod
@@ -173,32 +181,94 @@ def run_workflow_checks():
             return workflow.RegisteredLecture(
                 self.identity(number), self.list_snapshot.url, self.list_snapshot.geometry,
                 self.player_snapshot.url, self.player_snapshot.geometry, self.control,
-                (400.0, 300.0), duration, navigation)
+                self.target.identity, duration, navigation)
 
-        def pending_capture(self, number, duration):
+        def pending_metadata(self, number, duration):
             self.automation.pending = self.identity(number)
             self.automation.player_reader = self.player
             self.automation.deadline = 1030.0
-            self.player.take_video_capture.return_value = VideoCapture(400, 300, duration)
+            self.reader.page_snapshot.return_value = self.player_snapshot
+            workflow.read_video_state.return_value = VideoState(duration, 0, True, False, 4)
             self.automation._set_state("pending_player")
 
         def test_registration_preserves_order_and_three_minute_margin(self):
-            self.pending_capture(1, 60.5)
+            self.pending_metadata(1, 60.5)
             self.automation.tick()
-            self.pending_capture(2, 90.0)
+            self.pending_metadata(2, 90.0)
             self.automation.tick()
             entries = list(self.automation.queue)
             self.assertEqual([entry.identity for entry in entries], [self.identity(1), self.identity(2)])
             self.assertEqual([entry.wait_seconds for entry in entries], [240.5, 270.0])
-            self.assertEqual(entries[0].play_point, (400, 300))
+            self.assertEqual(entries[0].video_identity, self.target.identity)
+            self.assertIs(entries[0].player_control, self.control)
+            workflow.pyautogui.position.assert_not_called()
+            workflow.ComputerControl.assert_not_called()
+            self.control.calibrate.assert_not_called()
+            self.control.click.assert_not_called()
             self.assertEqual(self.window.queue_list.count(), 2)
 
-        def test_space_without_selected_lecture_does_not_register(self):
+        def test_no_selected_lecture_does_not_register(self):
             self.automation._set_state("registering")
-            self.player.take_video_capture.return_value = VideoCapture(400, 300, 60)
             self.automation.tick()
             self.assertFalse(self.automation.queue)
-            self.player.take_video_capture.assert_not_called()
+            self.reader.find_player_center.assert_not_called()
+
+        def test_metadata_loading_preserves_selection_then_registers_once_without_space(self):
+            self.pending_metadata(1, 60)
+            workflow.read_video_state.return_value = None
+            self.automation.tick()
+            self.assertEqual(self.automation.pending, self.identity(1))
+            self.assertEqual(self.automation.state, "pending_player")
+            self.assertFalse(self.automation.queue)
+            workflow.read_video_state.return_value = VideoState(60, 0, True, False, 1)
+            self.automation.tick()
+            self.automation.tick()
+            self.assertEqual(len(self.automation.queue), 1)
+            self.assertIsNone(self.automation.pending)
+            self.assertEqual(self.automation.state, "waiting_list")
+            workflow.pyautogui.position.assert_not_called()
+            self.control.click.assert_not_called()
+
+        def test_click_waits_for_player_page_and_metadata(self):
+            clicked = ClickedElement(self.identity(1), ElementPosition("button", 0, 0, 80, 30))
+            self.automation._set_state("registering")
+            self.automation._begin_player_registration(self.automation.generation, clicked)
+            self.automation.tick()  # Still on the list.
+            self.assertEqual(self.automation.pending, self.identity(1))
+            self.reader.page_snapshot.return_value = self.player_snapshot
+            workflow.read_video_state.return_value = None
+            self.automation.tick()
+            self.assertFalse(self.automation.queue)
+            workflow.read_video_state.return_value = VideoState(60, 0, True, False, 1)
+            self.automation.tick()
+            self.assertEqual(len(self.automation.queue), 1)
+            self.assertEqual(self.automation.queue[0].identity, self.identity(1))
+
+        def test_reselecting_registered_lecture_does_not_duplicate(self):
+            self.pending_metadata(1, 60)
+            self.automation.tick()
+            clicked = ClickedElement(self.identity(1), ElementPosition("button", 0, 0, 80, 30))
+            self.automation._begin_player_registration(self.automation.generation, clicked)
+            self.automation.tick()
+            self.assertEqual(len(self.automation.queue), 1)
+            self.assertEqual(self.automation.state, "waiting_list")
+
+        def test_metadata_loading_timeout_stops_without_registration(self):
+            self.pending_metadata(1, 60)
+            workflow.read_video_state.return_value = None
+            self.automation.deadline = 999
+            self.automation.tick()
+            self.assertEqual(self.automation.state, "stopped")
+            self.assertFalse(self.automation.queue)
+            self.control.click.assert_not_called()
+
+        def test_obscured_player_waits_without_registration(self):
+            self.pending_metadata(1, 60)
+            self.reader.find_player_center.return_value = None
+            self.automation.tick()
+            self.assertFalse(self.automation.queue)
+            self.assertEqual(self.automation.state, "pending_player")
+            self.control.click.assert_not_called()
 
         def test_click_received_during_navigation_query_preserves_selection(self):
             clicked = ClickedElement(
@@ -211,6 +281,55 @@ def run_workflow_checks():
             self.assertEqual(self.automation.pending, self.identity(1))
             self.assertFalse(self.automation.queue)
             self.control.click.assert_not_called()
+
+        def test_click_received_during_destroyed_context_preserves_selection(self):
+            clicked = ClickedElement(self.identity(1), ElementPosition("button", 0, 0, 80, 30))
+            self.reader.take_clicked_identity.side_effect = [None, clicked]
+            self.reader.page_snapshot.side_effect = BrowserReaderError('Execution context was destroyed')
+            self.reader.stop_click_observation.side_effect = BrowserReaderError('Execution context was destroyed')
+            self.automation._set_state("registering")
+            self.automation.tick()
+            self.assertEqual(self.automation.pending, self.identity(1))
+            self.assertEqual(self.automation.state, "pending_player")
+            self.assertFalse(self.automation.queue)
+            self.control.click.assert_not_called()
+
+        def test_navigation_context_retries_only_until_registration_deadline(self):
+            self.pending_metadata(1, 60)
+            self.reader.page_snapshot.side_effect = BrowserReaderError('Cannot find context with specified id')
+            self.automation.tick()
+            self.assertEqual(self.automation.state, "pending_player")
+            self.assertEqual(self.automation.pending, self.identity(1))
+            self.automation.deadline = 999
+            self.automation.tick()
+            self.assertEqual(self.automation.state, "stopped")
+            self.assertFalse(self.automation.queue)
+            self.control.click.assert_not_called()
+
+        def test_return_to_list_rearms_selection_and_finish_starts_playback(self):
+            self.pending_metadata(1, 60)
+            self.automation.tick()
+            self.reader.page_snapshot.return_value = self.list_snapshot
+            self.automation.tick()
+            self.assertEqual(self.automation.state, "registering")
+            self.assertIsNone(self.automation.player_reader)
+            self.reader.start_click_observation.assert_called_once_with()
+            self.automation.finish_registration()
+            self.assertEqual(self.automation.state, "playing")
+            self.assertEqual(self.automation.phase, "list")
+            self.assertEqual(len(self.automation.queue), 1)
+            self.control.click.assert_not_called()
+            self.assertNotIn('Space', self.window.registration_instructions.text())
+
+        def test_cdp_rejection_retains_navigation_reason(self):
+            socket = Mock()
+            socket.state.return_value = workflow.QAbstractSocket.SocketState.ConnectedState
+            reader = SimpleNamespace(_socket=socket, _request_id=0, _exchange=Mock(return_value={
+                'error': {'code': -32000, 'message': 'Cannot find default execution context'},
+            }))
+            with self.assertRaises(BrowserReaderError) as caught:
+                BrowserReader._command(reader, 'Runtime.evaluate')
+            self.assertTrue(caught.exception.during_navigation)
 
         def test_dom_query_error_preserves_exception_message_without_stack(self):
             reader = SimpleNamespace(_command=Mock(return_value={
@@ -249,20 +368,30 @@ def run_workflow_checks():
         def test_invalid_duration_is_rejected_before_queue_append(self):
             for duration in (float("nan"), float("inf"), 0.0, -1.0):
                 with self.subTest(duration=duration):
-                    self.pending_capture(1, duration)
+                    self.pending_metadata(1, duration)
                     self.automation.tick()
                     self.assertFalse(self.automation.queue)
                     self.assertEqual(self.automation.state, "stopped")
             workflow.ComputerControl.assert_not_called()
 
         def test_unfocused_player_is_rejected_before_queue_append(self):
-            self.pending_capture(1, 60)
+            self.pending_metadata(1, 60)
             self.player.page_snapshot.return_value = PageSnapshot(
                 self.player_snapshot.url, False, 0, 0, 1200, 900, 1180, 800, 1)
             self.automation.tick()
             self.assertFalse(self.automation.queue)
-            self.assertEqual(self.automation.state, "stopped")
+            self.assertEqual(self.automation.state, "pending_player")
             workflow.ComputerControl.assert_not_called()
+
+        def test_unmatched_list_item_stops_without_click(self):
+            self.automation.queue.append(self.lecture(1))
+            self.reader.find_registered_clickable.return_value = None
+            self.reader.scroll_registered_into_view.return_value = False
+            self.automation._begin_playback()
+            self.automation.tick()
+            self.control.click.assert_not_called()
+            self.assertEqual(self.automation.state, "stopped")
+            self.reader.scroll_registered_into_view.assert_called_once_with(self.identity(1))
 
         def test_scrolled_lecture_uses_fresh_coordinates(self):
             self.automation.queue.append(self.lecture(1))
@@ -273,6 +402,30 @@ def run_workflow_checks():
             self.automation.tick()
             self.reader.scroll_registered_into_view.assert_called_once_with(self.identity(1))
             self.control.click.assert_not_called()
+            self.assertEqual(self.automation.phase, "locate")
+            self.automation.tick()
+            self.control.click.assert_called_once_with(*fresh.center)
+            self.assertEqual(self.automation.phase, "opening")
+
+        def test_obscured_item_after_scroll_times_out_without_click(self):
+            self.automation.queue.append(self.lecture(1))
+            self.reader.find_registered_clickable.return_value = None
+            self.reader.scroll_registered_into_view.return_value = True
+            self.automation._begin_playback()
+            self.automation.tick()
+            self.automation.tick()
+            self.automation.deadline = 999
+            self.automation.tick()
+            self.reader.scroll_registered_into_view.assert_called_once_with(self.identity(1))
+            self.control.click.assert_not_called()
+            self.assertEqual(self.automation.state, "stopped")
+            self.assertEqual(len(self.automation.queue), 1)
+
+        def test_list_item_uses_fresh_coordinates(self):
+            self.automation.queue.append(self.lecture(1))
+            fresh = ElementPosition("button", 300, 450, 80, 30, "강의 1")
+            self.reader.find_registered_clickable.return_value = fresh
+            self.automation._begin_playback()
             self.automation.tick()
             self.control.click.assert_called_once_with(*fresh.center)
             self.assertEqual(self.automation.phase, "opening")
@@ -305,14 +458,14 @@ def run_workflow_checks():
             self.assertEqual(self.automation.state, "stopped")
             self.assertFalse(self.automation.timer.isActive())
 
-        def test_stop_during_capture_prevents_queue_append(self):
-            self.pending_capture(1, 60)
+        def test_stop_during_player_query_prevents_queue_append(self):
+            self.pending_metadata(1, 60)
 
-            def stop_during_capture():
+            def stop_during_query():
                 self.automation.stop()
-                return VideoCapture(400, 300, 60)
+                return self.target
 
-            self.player.take_video_capture.side_effect = stop_during_capture
+            self.player.find_player_center.side_effect = stop_during_query
             self.automation.tick()
             self.assertFalse(self.automation.queue)
             self.assertEqual(self.automation.state, "stopped")
@@ -324,6 +477,7 @@ def run_workflow_checks():
             self.automation.player_reader = self.player
             self.automation._set_state("playing")
             self.automation.phase = "starting"
+            self.reader.page_snapshot.return_value = self.player_snapshot
             with patch("main.read_video_state", return_value=VideoState(60.5, 0, False, False, 4)):
                 self.automation.tick()
             self.assertEqual(self.automation.phase, "watching")
@@ -336,6 +490,7 @@ def run_workflow_checks():
             self.automation._set_state("playing")
             self.automation.phase = "watching"
             self.automation.wait_until = 1000.0
+            self.reader.page_snapshot.return_value = self.player_snapshot
             self.automation.tick()
             self.assertEqual(list(self.automation.queue), [first, second])
             self.automation.tick()
@@ -353,22 +508,110 @@ def run_workflow_checks():
             self.assertEqual(list(self.automation.queue), [second])
             self.assertEqual(self.automation.phase, "list")
 
-        def test_popup_return_closes_player_and_preserves_entry_until_list_confirmed(self):
-            item = self.lecture(1, navigation="new")
-            self.automation.queue.append(item)
-            self.automation.player_reader = self.player
-            self.automation.owns_player = True
-            self.automation._set_state("playing")
-            self.automation.phase = "return"
+        def test_new_window_is_deferred_without_registration_or_input(self):
+            self.automation.pending = self.identity(1)
+            self.automation._set_state("pending_player")
+            workflow.browser_pages.return_value = {"list": "unused", "new": "unused"}
             self.automation.tick()
-            self.control.close_player.assert_called_once_with()
-            self.control.go_back.assert_not_called()
-            self.player.close.assert_not_called()
-            self.assertEqual(list(self.automation.queue), [item])
-            self.assertEqual(self.automation.phase, "returning")
-            self.automation.tick()
-            self.player.close.assert_called_once_with()
+            self.assertEqual(self.automation.state, "stopped")
             self.assertFalse(self.automation.queue)
+            self.control.click.assert_not_called()
+            self.control.go_back.assert_not_called()
+            self.control.calibrate.assert_not_called()
+
+        def prepare_video_start(self):
+            self.automation.queue.append(self.lecture(1))
+            self.reader.page_snapshot.return_value = self.player_snapshot
+            self.automation.player_reader = self.reader
+            self.automation._set_state("playing")
+            self.automation.phase = "opening"
+            self.automation.deadline = 1030
+
+        def test_playback_requeries_current_center_instead_of_registration_coordinates(self):
+            self.prepare_video_start()
+            moved = PlayerTarget(ElementPosition("div", 250, 150, 500, 300),
+                                 self.target.video_id, self.target.source)
+            self.reader.find_player_center.return_value = moved
+            self.automation.tick()
+            self.control.click.assert_called_once_with(500, 300)
+            self.assertEqual(self.reader.find_player_center.call_count, 2)
+            self.assertEqual(self.automation.phase, "starting")
+
+        def test_already_playing_does_not_click(self):
+            self.prepare_video_start()
+            workflow.read_video_state.return_value = VideoState(60, 0, False, False, 4)
+            self.automation.tick()
+            self.control.click.assert_not_called()
+            self.assertEqual(self.automation.phase, "watching")
+            self.assertEqual(self.automation.wait_until, 1240)
+
+        def test_playback_starting_during_last_query_does_not_click(self):
+            self.prepare_video_start()
+            workflow.read_video_state.side_effect = [VideoState(60, 0, True, False, 4),
+                                                     VideoState(60, 0, False, False, 4)]
+            self.automation.tick()
+            self.control.click.assert_not_called()
+            self.assertEqual(self.automation.phase, "watching")
+
+        def test_uncertain_video_targets_stop_without_input(self):
+            for target in (None, PlayerTarget(self.target.position, self.target.video_id,
+                                             "https://media.example/other.mp4")):
+                with self.subTest(target=target):
+                    self.automation.queue.clear()
+                    self.prepare_video_start()
+                    self.reader.find_player_center.return_value = target
+                    self.automation.tick()
+                    self.control.click.assert_not_called()
+                    self.assertEqual(self.automation.state, "stopped")
+                    self.assertEqual(len(self.automation.queue), 1)
+
+        def test_center_changing_before_click_stops_without_input(self):
+            self.prepare_video_start()
+            self.reader.find_player_center.side_effect = [self.target, PlayerTarget(
+                ElementPosition("div", 200, 100, 600, 400), self.target.video_id, self.target.source)]
+            self.automation.tick()
+            self.control.click.assert_not_called()
+            self.assertEqual(self.automation.state, "stopped")
+
+        def test_calibration_invalid_during_registration_does_not_register(self):
+            self.pending_metadata(1, 60)
+            self.control.scale = 2
+            self.automation.tick()
+            self.assertFalse(self.automation.queue)
+            self.control.click.assert_not_called()
+            self.assertEqual(self.automation.state, "stopped")
+
+        def test_calibration_invalid_during_playback_stops_before_click(self):
+            self.prepare_video_start()
+            self.automation.inspector.calibration_geometry = None
+            self.automation.tick()
+            self.control.click.assert_not_called()
+            self.assertEqual(self.automation.state, "stopped")
+
+        def test_focus_lost_before_click_stops_without_input(self):
+            self.prepare_video_start()
+            unfocused = PageSnapshot(self.player_snapshot.url, False, 0, 0, 1200, 900, 1180, 800, 1)
+            self.reader.page_snapshot.side_effect = [self.player_snapshot, unfocused]
+            self.automation.tick()
+            self.control.click.assert_not_called()
+            self.assertEqual(self.automation.state, "stopped")
+
+        def test_wrong_player_page_stops_without_input(self):
+            self.prepare_video_start()
+            self.reader.page_snapshot.return_value = self.list_snapshot
+            self.automation.tick()
+            self.control.click.assert_not_called()
+            self.assertEqual(self.automation.state, "stopped")
+
+        def test_stop_during_final_center_query_prevents_click(self):
+            self.prepare_video_start()
+            def query():
+                self.automation.stop()
+                return self.target
+            self.reader.find_player_center.side_effect = query
+            self.automation.tick()
+            self.control.click.assert_not_called()
+            self.assertEqual(self.automation.state, "stopped")
 
     class VideoElementChecks(unittest.TestCase):
         """Execute the production JavaScript on a local HTML player fixture."""
@@ -405,13 +648,14 @@ def run_workflow_checks():
                     currentTime: {value: 10, configurable: true},
                     paused: {value: true, configurable: true},
                     ended: {value: false, configurable: true},
-                    readyState: {value: 4, configurable: true}
+                    readyState: {value: 4, configurable: true},
+                    currentSrc: {value: 'https://media.example/lecture-1.mp4', configurable: true}
                 });
                 true;
             ''')
             self.reader = SimpleNamespace(
                 _evaluate=self.evaluate, _binding_installed=True, _observation_mode=None,
-                _observation_error=None, _clicks=deque(), _video_captures=deque(),
+                _observation_error=None, _clicks=deque(),
                 _binding_name='_test_capture', _listener_name='_test_listeners')
 
         def tearDown(self):
@@ -466,6 +710,14 @@ def run_workflow_checks():
             self.evaluate('Object.defineProperty(video, "duration", {value: NaN}); true;')
             self.assertIsNone(read_video_state(self.reader))
 
+        def test_metadata_not_ready_waits_even_with_finite_duration(self):
+            self.evaluate('Object.defineProperty(video, "readyState", {value: 0}); true;')
+            self.assertIsNone(read_video_state(self.reader))
+
+        def test_metadata_ready_allows_registration_before_playback_data(self):
+            self.evaluate('Object.defineProperty(video, "readyState", {value: 1}); true;')
+            self.assertEqual(read_video_state(self.reader), VideoState(60.5, 10, True, False, 1))
+
         def test_duplicate_player_is_rejected(self):
             self.evaluate('document.body.appendChild(player.cloneNode(true)); true;')
             with self.assertRaisesRegex(BrowserReaderError, 'Ambiguous'):
@@ -476,18 +728,71 @@ def run_workflow_checks():
             with self.assertRaisesRegex(BrowserReaderError, 'Ambiguous'):
                 read_video_state(self.reader)
 
-        def test_wrapped_video_coordinates_reject_outside_and_unrelated_overlay(self):
-            self.assertTrue(BrowserReader.video_point_is_visible(self.reader, 400, 300))
-            self.assertFalse(BrowserReader.video_point_is_visible(self.reader, 50, 300))
+        def test_player_center_comes_from_container_and_actual_video_identity(self):
+            target = BrowserReader.find_player_center(self.reader)
+            self.assertEqual(target.position.center, (400, 300))
+            self.assertEqual(target.identity,
+                             ('my-video_html5_api', 'https://media.example/lecture-1.mp4'))
+
+        def test_player_center_moves_with_dom(self):
+            self.evaluate("player.style.left = '200px'; true;")
+            self.assertEqual(BrowserReader.find_player_center(self.reader).position.center, (500, 300))
+
+        def test_player_center_rejects_unrelated_overlay(self):
             self.evaluate('''
                 var cover = document.createElement('div');
                 cover.style = 'position: fixed; inset: 0; z-index: 100;';
                 document.body.appendChild(cover);
                 true;
             ''')
-            self.assertFalse(BrowserReader.video_point_is_visible(self.reader, 400, 300))
+            self.assertIsNone(BrowserReader.find_player_center(self.reader))
 
-        def test_space_registration_captures_wrapped_video_duration(self):
+        def test_player_center_rejects_unknown_source(self):
+            self.evaluate('Object.defineProperty(video, "currentSrc", {value: ""}); true;')
+            self.assertIsNone(BrowserReader.find_player_center(self.reader))
+
+        def test_player_center_rejects_hidden_player(self):
+            self.evaluate('player.style.opacity = "0"; true;')
+            self.assertIsNone(BrowserReader.find_player_center(self.reader))
+
+        def test_player_center_rejects_outside_viewport(self):
+            self.evaluate('player.style.left = "-700px"; true;')
+            self.assertIsNone(BrowserReader.find_player_center(self.reader))
+
+        def test_player_center_rejects_multiple_videos(self):
+            self.evaluate('player.appendChild(video.cloneNode()); true;')
+            with self.assertRaisesRegex(BrowserReaderError, 'Ambiguous'):
+                BrowserReader.find_player_center(self.reader)
+
+        def test_player_center_waits_for_metadata(self):
+            self.evaluate('Object.defineProperty(video, "readyState", {value: 0}); true;')
+            self.assertIsNone(BrowserReader.find_player_center(self.reader))
+
+        def test_cdp_scroll_requires_matching_identity_and_does_not_click(self):
+            self.evaluate('''
+                var lecture = document.createElement('button');
+                lecture.id = 'lecture-scroll'; lecture.textContent = '강의';
+                lecture.style = 'position: absolute; top: 1800px; left: 100px;';
+                var clicks = 0;
+                lecture.addEventListener('click', () => clicks++);
+                document.body.appendChild(lecture);
+                true;
+            ''')
+            wrong = ElementIdentity('#lecture-scroll', 'button', '다른 강의',
+                                    (('id', 'lecture-scroll'),), '')
+            self.assertFalse(BrowserReader.scroll_registered_into_view(self.reader, wrong))
+            self.assertEqual(self.evaluate('window.scrollY'), 0)
+            expected = ElementIdentity('#lecture-scroll', 'button', '강의',
+                                       (('id', 'lecture-scroll'),), '')
+            self.assertTrue(BrowserReader.scroll_registered_into_view(self.reader, expected))
+            self.assertGreater(self.evaluate('window.scrollY'), 0)
+            self.assertTrue(self.evaluate('''(() => {
+                const rect = lecture.getBoundingClientRect();
+                return rect.top >= 0 && rect.bottom <= innerHeight;
+            })()'''))
+            self.assertEqual(self.evaluate('clicks'), 0)
+
+        def test_registration_observer_only_watches_list_clicks_without_space(self):
             self.evaluate('''
                 var callbacks = {}, captures = [];
                 document.hasFocus = () => true;
@@ -495,14 +800,15 @@ def run_workflow_checks():
                 window._test_capture = value => captures.push(JSON.parse(value));
                 true;
             ''')
-            BrowserReader._start_observation(self.reader, 'video')
-            self.evaluate('''
-                callbacks.pointermove({isTrusted: true, clientX: 400, clientY: 300});
-                callbacks.keyup({isTrusted: true, code: 'Space'});
-                true;
-            ''')
-            self.assertEqual(self.evaluate('captures'), [
-                {'mode': 'video', 'web_x': 400, 'web_y': 300, 'duration': 60.5}])
+            BrowserReader._start_observation(self.reader, 'click')
+            self.assertEqual(self.evaluate('Object.keys(callbacks)'), ['click'])
+            self.assertFalse(hasattr(BrowserReader, 'start_video_observation'))
+            self.assertFalse(hasattr(BrowserReader, 'take_video_capture'))
+            self.evaluate("callbacks.click({isTrusted: true, button: 0, target: document.querySelector('#play')}); true;")
+            captures = self.evaluate('captures')
+            self.assertEqual(len(captures), 1)
+            self.assertEqual(captures[0]['mode'], 'click')
+            self.assertEqual(captures[0]['identity']['selector'], '#play')
 
     suite = unittest.TestSuite([
         unittest.defaultTestLoader.loadTestsFromTestCase(WorkflowChecks),
