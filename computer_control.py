@@ -203,6 +203,10 @@ class ComputerControl:
     def move_to(self, web_x: float, web_y: float):
         pyautogui.moveTo(*self._screen_point(web_x, web_y))
 
+    def screen_aligned_web_point(self, web_x: float, web_y: float):
+        """Return the web point that click() reaches after screen-pixel rounding."""
+        return self.screen_to_web(*self._screen_point(web_x, web_y))
+
     def click(self, web_x: float, web_y: float):
         """Caller must query fresh geometry and verify the foreground tab first."""
         pyautogui.click(*self._screen_point(web_x, web_y))

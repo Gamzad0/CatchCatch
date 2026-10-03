@@ -441,9 +441,12 @@ def run_workflow_checks():
             self.target = PlayerTarget(ElementPosition("div", 100, 100, 600, 400),
                                        "my-video_html5_api", "https://media.example/lecture-1.mp4")
             self.reader.find_player_center.return_value = self.target
+            self.reader.is_player_corner_clear.return_value = True
+            self.reader.player_has_focus.return_value = False
             self.control = Mock(spec=ComputerControl)
             self.control.scale = 1
             self.control.offset = (0, 100)
+            self.control.screen_aligned_web_point.return_value = (100, 100)
             inspector = SimpleNamespace(
                 reader=self.reader, control=self.control, busy=False,
                 calibration_geometry=self.list_snapshot.geometry, timer=Mock())
@@ -872,6 +875,7 @@ def run_workflow_checks():
             self.assertEqual(list(self.automation.queue), [first, second])
             self.automation.tick()
             self.control.go_back.assert_called_once_with()
+            self.control.click.assert_called_once_with(100, 100)
             self.assertEqual(list(self.automation.queue), [first, second])
             self.reader.page_snapshot.return_value = self.player_snapshot
             self.automation.tick()
@@ -884,6 +888,77 @@ def run_workflow_checks():
             self.automation.tick()
             self.assertEqual(list(self.automation.queue), [second])
             self.assertEqual(self.automation.phase, "list")
+
+        def prepare_list_return(self):
+            self.automation.queue.clear()
+            self.automation.queue.append(self.lecture(1))
+            self.automation.player_reader = self.reader
+            self.reader.page_snapshot.return_value = self.player_snapshot
+            self.automation._set_state("playing")
+            self.automation.phase = "return"
+
+        def test_back_waits_for_corner_click_and_verified_focus_release(self):
+            self.prepare_list_return()
+            actions = []
+            self.control.click.side_effect = lambda *point: actions.append('corner')
+            self.reader.player_has_focus.side_effect = lambda: actions.append('focus') or False
+            self.control.go_back.side_effect = lambda: actions.append('back')
+            self.automation.tick()
+            self.assertEqual(actions, ['corner', 'focus', 'back'])
+            self.assertEqual(self.automation.phase, 'returning')
+            self.assertEqual(len(self.automation.queue), 1)
+
+        def test_unsafe_corner_stops_before_mouse_or_keyboard_input(self):
+            self.prepare_list_return()
+            self.reader.is_player_corner_clear.return_value = False
+            self.automation.tick()
+            self.control.click.assert_not_called()
+            self.control.go_back.assert_not_called()
+            self.assertEqual(self.automation.state, 'stopped')
+            self.assertEqual(len(self.automation.queue), 1)
+
+        def test_moved_player_corner_stops_before_input(self):
+            self.prepare_list_return()
+            moved = PlayerTarget(ElementPosition('div', 200, 100, 600, 400),
+                                 self.target.video_id, self.target.source)
+            self.reader.find_player_center.side_effect = [self.target, moved]
+            self.automation.tick()
+            self.control.click.assert_not_called()
+            self.control.go_back.assert_not_called()
+            self.assertEqual(self.automation.state, 'stopped')
+
+        def test_unverified_focus_release_stops_before_back_input(self):
+            for focused in (True, None):
+                with self.subTest(focused=focused):
+                    self.prepare_list_return()
+                    self.reader.player_has_focus.return_value = focused
+                    self.control.reset_mock()
+                    self.automation.tick()
+                    self.control.click.assert_called_once_with(100, 100)
+                    self.control.go_back.assert_not_called()
+                    self.assertEqual(self.automation.state, 'stopped')
+                    self.assertIn('포커스 해제', self.window.playback_status.text())
+                    self.assertTrue(self.automation.queue)
+
+        def test_window_movement_after_corner_click_prevents_back_input(self):
+            self.prepare_list_return()
+            moved = PageSnapshot(self.player_snapshot.url, True, 20, 0, 1200, 900, 1180, 800, 1)
+            self.reader.page_snapshot.side_effect = [
+                self.player_snapshot, self.player_snapshot, moved,
+            ]
+            self.automation.tick()
+            self.control.click.assert_called_once_with(100, 100)
+            self.control.go_back.assert_not_called()
+            self.assertEqual(self.automation.state, 'stopped')
+
+        def test_stop_during_corner_query_prevents_input(self):
+            self.prepare_list_return()
+            self.reader.is_player_corner_clear.side_effect = lambda *point: self.automation.stop() or True
+            self.automation.tick()
+            self.control.click.assert_not_called()
+            self.control.go_back.assert_not_called()
+            self.assertEqual(self.automation.state, 'stopped')
+            self.assertEqual(len(self.automation.queue), 1)
 
         def test_back_input_report_is_included_in_return_timeout(self):
             self.automation.queue.append(self.lecture(1))
@@ -1209,6 +1284,71 @@ def run_workflow_checks():
         def test_player_center_waits_for_metadata(self):
             self.evaluate('Object.defineProperty(video, "readyState", {value: 0}); true;')
             self.assertIsNone(BrowserReader.find_player_center(self.reader))
+
+        def round_player(self):
+            # Model the confirmed corner where pointer input reaches the background.
+            self.evaluate("""
+                player.style.borderRadius = '24px'; player.style.overflow = 'hidden';
+                player.style.clipPath = 'inset(0 round 24px)'; true;
+            """)
+
+        def test_rounded_corner_exposes_background_without_clicking_video(self):
+            self.round_player()
+            self.assertTrue(BrowserReader.is_player_corner_clear(self.reader, 100, 100))
+            self.assertFalse(BrowserReader.is_player_corner_clear(self.reader, 400, 300))
+
+        def test_square_corner_is_rejected(self):
+            self.assertFalse(BrowserReader.is_player_corner_clear(self.reader, 100, 100))
+
+        def test_rounded_corner_rejects_unrelated_overlay_or_button(self):
+            self.round_player()
+            for tag in ('div', 'button'):
+                with self.subTest(tag=tag):
+                    self.evaluate('''
+                        var cover = document.createElement(''' + json.dumps(tag) + ''');
+                        cover.style = 'position: absolute; left: 90px; top: 90px; '
+                            + 'width: 30px; height: 30px; z-index: 100;';
+                        document.body.appendChild(cover); true;
+                    ''')
+                    self.assertFalse(BrowserReader.is_player_corner_clear(self.reader, 100, 100))
+                    self.evaluate('cover.remove(); true;')
+
+        def test_rounded_corner_rejects_interactive_background(self):
+            self.round_player()
+            self.evaluate("document.documentElement.tabIndex = 0; true;")
+            self.assertFalse(BrowserReader.is_player_corner_clear(self.reader, 100, 100))
+
+        def test_fractional_corner_checks_the_actual_rounded_screen_point(self):
+            self.round_player()
+            self.evaluate("player.style.left = '100.4px'; player.style.top = '100.4px'; true;")
+            control = ComputerControl()
+            control.calibrate(0, 0, screen_point=(0, 100))
+            with patch.object(desktop.pyautogui, 'onScreen', return_value=True):
+                corner = control.screen_aligned_web_point(100.4, 100.4)
+                self.assertTrue(BrowserReader.is_player_corner_clear(self.reader, *corner))
+                with patch.object(desktop.pyautogui, 'click') as click:
+                    control.click(*corner)
+                click.assert_called_once_with(100, 200)
+
+        def test_corner_click_releases_player_focus_in_local_browser(self):
+            from PySide6.QtCore import QPoint, Qt
+            from PySide6.QtTest import QTest
+
+            self.round_player()
+            self.evaluate('document.hasFocus = () => true; player.tabIndex = 0; player.focus(); true;')
+            self.assertTrue(BrowserReader.player_has_focus(self.reader))
+            QTest.mouseClick(self.view.focusProxy() or self.view,
+                             Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                             QPoint(100, 100))
+            self.assertFalse(BrowserReader.player_has_focus(self.reader))
+
+        def test_focus_check_detects_player_controls_and_unknown_page(self):
+            self.evaluate("document.hasFocus = () => true; document.querySelector('#play').focus(); true;")
+            self.assertTrue(BrowserReader.player_has_focus(self.reader))
+            self.evaluate('document.hasFocus = () => false; true;')
+            self.assertIsNone(BrowserReader.player_has_focus(self.reader))
+            self.evaluate('player.remove(); document.hasFocus = () => true; true;')
+            self.assertIsNone(BrowserReader.player_has_focus(self.reader))
 
         def test_cdp_scroll_requires_matching_identity_and_does_not_click(self):
             self.evaluate('''

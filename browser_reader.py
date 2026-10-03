@@ -461,6 +461,36 @@ class BrowserReader:
             raise BrowserReaderError('Invalid player target')
         return target
 
+    def is_player_corner_clear(self, web_x: float, web_y: float) -> bool:
+        """Check that the rounded top-left corner exposes a noninteractive ancestor."""
+        if not math.isfinite(web_x) or not math.isfinite(web_y):
+            raise ValueError('Coordinates must be finite')
+        return self._evaluate('(() => {' + _VIDEO_ELEMENT_HELPER +
+            'const x = ' + json.dumps(web_x) + ', y = ' + json.dumps(web_y) + r''';
+            if (!lectureVideo()) return false;
+            const player = document.querySelector('#my-video');
+            const rect = player.getBoundingClientRect();
+            const tolerance = 0.5 / window.devicePixelRatio + 1e-6;
+            if (rect.width <= 0 || rect.height <= 0 ||
+                Math.abs(x - rect.left) > tolerance ||
+                Math.abs(y - rect.top) > tolerance ||
+                x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return false;
+            const hit = document.elementFromPoint(x, y);
+            if (!hit || player.contains(hit) || !hit.contains(player)) return false;
+            return !hit.closest('a, button, input, select, textarea, label, video, audio, '
+                + 'iframe, frame, [tabindex], [contenteditable], [role="button"], '
+                + '[role="link"], [role="dialog"], [inert], [aria-disabled="true"]');
+        })()''') is True
+
+    def player_has_focus(self) -> Optional[bool]:
+        """Observe focus inside the player; None means it cannot be verified."""
+        value = self._evaluate('(() => {' + _VIDEO_ELEMENT_HELPER + r'''
+            if (!lectureVideo() || !document.hasFocus() || !document.activeElement)
+                return null;
+            return document.querySelector('#my-video').contains(document.activeElement);
+        })()''')
+        return value if isinstance(value, bool) else None
+
     @staticmethod
     def _identity(value):
         if not isinstance(value, dict):

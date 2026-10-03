@@ -755,6 +755,25 @@ class LectureAutomation(QObject):
         if not snapshot.has_focus:
             self.window.playback_status.setText("대기 완료. 영상 재생창을 활성화하면 강의 목록으로 돌아갑니다.")
             return
+        target = self._read(generation, self.player_reader.find_player_center)
+        if target is None:
+            raise RuntimeError("뒤로 가기 전에 플레이어의 현재 위치를 확인하지 못했습니다.")
+        corner = self.inspector.control.screen_aligned_web_point(
+            target.position.x, target.position.y)
+        clear = self._read(generation, self.player_reader.is_player_corner_clear, *corner)
+        fresh_target = self._read(generation, self.player_reader.find_player_center)
+        fresh = self._read(generation, self.player_reader.page_snapshot)
+        self._verify_snapshot(fresh, item.player_url, item.player_geometry)
+        self._verify_calibration(self.player_reader, fresh)
+        if not clear or fresh_target != target or not fresh.has_focus:
+            raise RuntimeError("플레이어 왼쪽 위 모서리의 빈 영역 또는 현재 위치를 확인하지 못했습니다.")
+        self.inspector.control.click(*corner)
+        fresh = self._read(generation, self.player_reader.page_snapshot)
+        self._verify_snapshot(fresh, item.player_url, item.player_geometry)
+        self._verify_calibration(self.player_reader, fresh)
+        if (not fresh.has_focus or
+                self._read(generation, self.player_reader.player_has_focus) is not False):
+            raise RuntimeError("모서리를 클릭했지만 플레이어의 키보드 포커스 해제를 확인하지 못했습니다.")
         self.phase = "returning"
         self.deadline = time.monotonic() + 30
         self.window.playback_status.setText("대기 완료. 강의 목록으로 돌아가는 중입니다…")
