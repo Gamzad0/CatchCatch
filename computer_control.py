@@ -55,13 +55,16 @@ class ComputerControl:
         self.offset  # Require a valid calibration.
         return self._scale
 
-    def calibrate(self, web_x: float, web_y: float, *, scale: float = 1.0):
+    def calibrate(self, web_x: float, web_y: float, *, scale: float = 1.0,
+                  screen_point=None):
         """Calibrate at a known web point using the browser's pixel ratio."""
         if not math.isfinite(web_x) or not math.isfinite(web_y):
             raise ValueError('Coordinates must be finite')
         if isinstance(scale, bool) or not math.isfinite(scale) or scale <= 0:
             raise ValueError('Scale must be finite and positive')
-        screen_x, screen_y = pyautogui.position()
+        screen_x, screen_y = pyautogui.position() if screen_point is None else screen_point
+        if not math.isfinite(screen_x) or not math.isfinite(screen_y):
+            raise ValueError('Screen coordinates must be finite')
         self._offset = screen_x - web_x * scale, screen_y - web_y * scale
         self._scale = scale
         return self._offset
@@ -96,3 +99,11 @@ class ComputerControl:
     def click(self, web_x: float, web_y: float):
         """Caller must query fresh geometry and verify the foreground tab first."""
         pyautogui.click(*self._screen_point(web_x, web_y))
+
+    def go_back(self):
+        """Return from a verified same-tab player using real keyboard input."""
+        pyautogui.hotkey('alt', 'left')
+
+    def close_player(self):
+        """Close only a verified foreground player tab/window."""
+        pyautogui.hotkey('ctrl', 'w')

@@ -6,6 +6,9 @@ Keep the test tab foreground, unobscured, and at the same window position.
 Press Enter using the keyboard without moving the cursor from the requested
 point. Chrome's devicePixelRatio accounts for display scale and desktop zoom.
 
+Run with --workflow-checks for offline registration and queue regression checks.
+That mode uses an offscreen Qt window and mocked browser/mouse access.
+
 Required buttons in test.html:
     #reference: the upper-left button labeled '보정 기준'.
     #target: the lower-right button labeled '클릭 대상', containing a span.
@@ -16,6 +19,7 @@ import argparse
 import json
 import math
 import subprocess
+import sys
 import pyautogui
 from pathlib import Path
 from urllib.error import URLError
@@ -103,6 +107,239 @@ def check_calibration_scale(reader, control):
         raise RuntimeError("보정 이후 화면 배율 또는 Chrome 확대율이 바뀌었습니다. 테스트를 다시 실행하세요.")
 
 
+def run_workflow_checks():
+    """Exercise registration and queue transitions without Chrome or real input."""
+    import os
+    import unittest
+    from types import SimpleNamespace
+    from unittest.mock import Mock, patch
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from browser_reader import ClickedElement, ElementIdentity, ElementPosition, PageSnapshot, VideoCapture
+    from ui import MainWindow
+    from video_state import VideoState
+    import main as workflow
+
+    app = QApplication.instance() or QApplication([])
+
+    class WorkflowChecks(unittest.TestCase):
+        def setUp(self):
+            self.window = MainWindow()
+            self.list_snapshot = PageSnapshot(
+                "https://lms.example/course", True, 0, 0, 1200, 900, 1180, 800, 1)
+            self.player_snapshot = PageSnapshot(
+                "https://lms.example/player", True, 0, 0, 1200, 900, 1180, 800, 1)
+            self.reader = Mock(spec=BrowserReader)
+            self.reader.page_snapshot.return_value = self.list_snapshot
+            self.reader.take_clicked_identity.return_value = None
+            self.player = Mock(spec=BrowserReader)
+            self.player.page_snapshot.return_value = self.player_snapshot
+            self.player.video_point_is_visible.return_value = True
+            self.control = Mock(spec=ComputerControl)
+            inspector = SimpleNamespace(
+                reader=self.reader, control=self.control, busy=False,
+                calibration_geometry=self.list_snapshot.geometry, timer=Mock())
+            connection = SimpleNamespace(socket=Mock(), endpoint="http://127.0.0.1:9222")
+            self.automation = workflow.LectureAutomation(self.window, connection, inspector)
+            self.automation.list_reader = self.reader
+            self.automation.list_url = self.list_snapshot.url
+            self.automation.list_geometry = self.list_snapshot.geometry
+            self.clock = patch.object(workflow.time, "monotonic", return_value=1000.0)
+            self.clock.start()
+            self.pages = patch.object(workflow, "browser_pages", return_value={"list": "unused"})
+            self.pages.start()
+            self.player_controls = patch.object(workflow, "ComputerControl")
+            self.player_controls.start()
+            self.mouse_position = patch.object(workflow.pyautogui, "position", return_value=(400, 300))
+            self.mouse_position.start()
+
+        def tearDown(self):
+            self.automation.stop()
+            self.clock.stop()
+            self.pages.stop()
+            self.player_controls.stop()
+            self.mouse_position.stop()
+            self.window.close()
+
+        @staticmethod
+        def identity(number):
+            return ElementIdentity(f"#lecture-{number}", "button", f"강의 {number}", (), "")
+
+        def lecture(self, number, duration=60.0, navigation="same"):
+            return workflow.RegisteredLecture(
+                self.identity(number), self.list_snapshot.url, self.list_snapshot.geometry,
+                self.player_snapshot.url, self.player_snapshot.geometry, self.control,
+                (400.0, 300.0), duration, navigation)
+
+        def pending_capture(self, number, duration):
+            self.automation.pending = self.identity(number)
+            self.automation.player_reader = self.player
+            self.automation.deadline = 1030.0
+            self.player.take_video_capture.return_value = VideoCapture(400, 300, duration)
+            self.automation._set_state("pending_player")
+
+        def test_registration_preserves_order_and_three_minute_margin(self):
+            self.pending_capture(1, 60.5)
+            self.automation.tick()
+            self.pending_capture(2, 90.0)
+            self.automation.tick()
+            entries = list(self.automation.queue)
+            self.assertEqual([entry.identity for entry in entries], [self.identity(1), self.identity(2)])
+            self.assertEqual([entry.wait_seconds for entry in entries], [240.5, 270.0])
+            self.assertEqual(entries[0].play_point, (400, 300))
+            self.assertEqual(self.window.queue_list.count(), 2)
+
+        def test_space_without_selected_lecture_does_not_register(self):
+            self.automation._set_state("registering")
+            self.player.take_video_capture.return_value = VideoCapture(400, 300, 60)
+            self.automation.tick()
+            self.assertFalse(self.automation.queue)
+            self.player.take_video_capture.assert_not_called()
+
+        def test_click_received_during_navigation_query_preserves_selection(self):
+            clicked = ClickedElement(
+                self.identity(1), ElementPosition("button", 300, 450, 80, 30, "강의 1"))
+            self.reader.take_clicked_identity.side_effect = [None, clicked]
+            self.reader.page_snapshot.return_value = self.player_snapshot
+            self.automation._set_state("registering")
+            self.automation.tick()
+            self.assertEqual(self.automation.state, "pending_player")
+            self.assertEqual(self.automation.pending, self.identity(1))
+            self.assertFalse(self.automation.queue)
+            self.control.click.assert_not_called()
+
+        def test_invalid_duration_is_rejected_before_queue_append(self):
+            for duration in (float("nan"), float("inf"), 0.0, -1.0):
+                with self.subTest(duration=duration):
+                    self.pending_capture(1, duration)
+                    self.automation.tick()
+                    self.assertFalse(self.automation.queue)
+                    self.assertEqual(self.automation.state, "stopped")
+            workflow.ComputerControl.assert_not_called()
+
+        def test_unfocused_player_is_rejected_before_queue_append(self):
+            self.pending_capture(1, 60)
+            self.player.page_snapshot.return_value = PageSnapshot(
+                self.player_snapshot.url, False, 0, 0, 1200, 900, 1180, 800, 1)
+            self.automation.tick()
+            self.assertFalse(self.automation.queue)
+            self.assertEqual(self.automation.state, "stopped")
+            workflow.ComputerControl.assert_not_called()
+
+        def test_scrolled_lecture_uses_fresh_coordinates(self):
+            self.automation.queue.append(self.lecture(1))
+            fresh = ElementPosition("button", 300, 450, 80, 30, "강의 1")
+            self.reader.find_registered_clickable.side_effect = [None, fresh, fresh]
+            self.reader.scroll_registered_into_view.return_value = True
+            self.automation._begin_playback()
+            self.automation.tick()
+            self.reader.scroll_registered_into_view.assert_called_once_with(self.identity(1))
+            self.control.click.assert_not_called()
+            self.automation.tick()
+            self.control.click.assert_called_once_with(*fresh.center)
+            self.assertEqual(self.automation.phase, "opening")
+
+        def test_moved_window_stops_before_input(self):
+            item = self.lecture(1)
+            self.automation.queue.append(item)
+            self.reader.page_snapshot.return_value = PageSnapshot(
+                self.list_snapshot.url, True, 20, 0, 1200, 900, 1180, 800, 1)
+            self.automation._begin_playback()
+            self.automation.tick()
+            self.control.click.assert_not_called()
+            self.reader.find_registered_clickable.assert_not_called()
+            self.assertEqual(self.automation.state, "stopped")
+            self.assertEqual(list(self.automation.queue), [item])
+
+        def test_stop_during_element_query_prevents_click(self):
+            item = self.lecture(1)
+            self.automation.queue.append(item)
+            self.automation._begin_playback()
+
+            def stop_during_query(_identity):
+                self.automation.stop()
+                return ElementPosition("button", 300, 450, 80, 30, "강의 1")
+
+            self.reader.find_registered_clickable.side_effect = stop_during_query
+            self.automation.tick()
+            self.control.click.assert_not_called()
+            self.assertEqual(list(self.automation.queue), [item])
+            self.assertEqual(self.automation.state, "stopped")
+            self.assertFalse(self.automation.timer.isActive())
+
+        def test_stop_during_capture_prevents_queue_append(self):
+            self.pending_capture(1, 60)
+
+            def stop_during_capture():
+                self.automation.stop()
+                return VideoCapture(400, 300, 60)
+
+            self.player.take_video_capture.side_effect = stop_during_capture
+            self.automation.tick()
+            self.assertFalse(self.automation.queue)
+            self.assertEqual(self.automation.state, "stopped")
+            workflow.ComputerControl.assert_not_called()
+
+        def test_confirmed_playback_starts_full_duration_timer(self):
+            item = self.lecture(1, 60.5)
+            self.automation.queue.append(item)
+            self.automation.player_reader = self.player
+            self.automation._set_state("playing")
+            self.automation.phase = "starting"
+            with patch("main.read_video_state", return_value=VideoState(60.5, 0, False, False, 4)):
+                self.automation.tick()
+            self.assertEqual(self.automation.phase, "watching")
+            self.assertEqual(self.automation.wait_until, 1240.5)
+
+        def test_queue_advances_only_after_verified_list_return(self):
+            first, second = self.lecture(1), self.lecture(2)
+            self.automation.queue.extend([first, second])
+            self.automation.player_reader = self.player
+            self.automation._set_state("playing")
+            self.automation.phase = "watching"
+            self.automation.wait_until = 1000.0
+            self.automation.tick()
+            self.assertEqual(list(self.automation.queue), [first, second])
+            self.automation.tick()
+            self.control.go_back.assert_called_once_with()
+            self.assertEqual(list(self.automation.queue), [first, second])
+            self.reader.page_snapshot.return_value = self.player_snapshot
+            self.automation.tick()
+            self.assertEqual(list(self.automation.queue), [first, second])
+            self.reader.page_snapshot.return_value = PageSnapshot(
+                self.list_snapshot.url, False, 0, 0, 1200, 900, 1180, 800, 1)
+            self.automation.tick()
+            self.assertEqual(list(self.automation.queue), [first, second])
+            self.reader.page_snapshot.return_value = self.list_snapshot
+            self.automation.tick()
+            self.assertEqual(list(self.automation.queue), [second])
+            self.assertEqual(self.automation.phase, "list")
+
+        def test_popup_return_closes_player_and_preserves_entry_until_list_confirmed(self):
+            item = self.lecture(1, navigation="new")
+            self.automation.queue.append(item)
+            self.automation.player_reader = self.player
+            self.automation.owns_player = True
+            self.automation._set_state("playing")
+            self.automation.phase = "return"
+            self.automation.tick()
+            self.control.close_player.assert_called_once_with()
+            self.control.go_back.assert_not_called()
+            self.player.close.assert_not_called()
+            self.assertEqual(list(self.automation.queue), [item])
+            self.assertEqual(self.automation.phase, "returning")
+            self.automation.tick()
+            self.player.close.assert_called_once_with()
+            self.assertFalse(self.automation.queue)
+
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(WorkflowChecks)
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    # Keep the application alive until every QObject in the checks is cleaned up.
+    app.processEvents()
+    return 0 if result.wasSuccessful() else 1
+
+
 def main():
     parser = argparse.ArgumentParser(description="로컬 test.html 좌표 변환 테스트")
     parser.add_argument("--cdp-endpoint", required=True,
@@ -178,4 +415,4 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_workflow_checks() if sys.argv[1:] == ["--workflow-checks"] else main())
