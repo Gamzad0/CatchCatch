@@ -348,6 +348,12 @@ class BrowserReader:
         """Whether the selected tab currently owns keyboard focus."""
         return self._evaluate('document.hasFocus()') is True
 
+    def visible_page_title(self) -> Optional[str]:
+        """Read a displayed tab's title, or None while it is hidden/loading."""
+        value = self._evaluate(
+            'document.visibilityState === "visible" ? document.title : null')
+        return value if isinstance(value, str) and value.strip() else None
+
     def find_clickable(self, selector: str) -> Optional[ElementPosition]:
         """Find a unique selector match, then its closest clickable ancestor.
 

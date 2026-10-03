@@ -123,8 +123,201 @@ def run_workflow_checks():
     from ui import MainWindow
     from video_state import VideoState, read_video_state
     import main as workflow
+    import computer_control as desktop
 
     app = QApplication.instance() or QApplication([])
+
+    class WindowLayoutChecks(unittest.TestCase):
+        def setUp(self):
+            self.gui = Mock()
+            self.gui.IsWindow.return_value = True
+            self.gui.IsWindowVisible.return_value = True
+            self.gui.IsIconic.return_value = False
+            self.gui.IsZoomed.return_value = False
+            self.gui.GetClassName.return_value = 'Chrome_WidgetWin_1'
+            self.gui.GetWindowText.return_value = 'CatchCatch 좌표 보정 - Google Chrome'
+            self.gui.EnumWindows.side_effect = lambda callback, data: callback(22, data)
+            self.api = Mock()
+            # Odd width and a taskbar at the top: never assume a 1920x1080 desktop.
+            self.api.GetMonitorInfo.return_value = {'Work': (0, 40, 1919, 1080)}
+            self.constants = SimpleNamespace(
+                MONITOR_DEFAULTTOPRIMARY=1, SW_RESTORE=9, HWND_TOP=0,
+                SWP_NOACTIVATE=16, SWP_SHOWWINDOW=64)
+            class NativeError(Exception):
+                pass
+            self.modules = patch.dict(sys.modules, {
+                'win32api': self.api, 'win32gui': self.gui,
+                'win32con': self.constants, 'pywintypes': SimpleNamespace(error=NativeError),
+            })
+            self.modules.start()
+            self.platform = patch.object(desktop.sys, 'platform', 'win32')
+            self.platform.start()
+            self.addCleanup(self.modules.stop)
+            self.addCleanup(self.platform.stop)
+
+        def test_split_excludes_taskbar_and_waits_for_two_matching_observations(self):
+            layout = desktop.WindowLayout(11, 'CatchCatch 좌표 보정')
+            layout.start()
+            self.gui.SetWindowPos.assert_any_call(11, 0, 959, 40, 960, 1040, 80)
+            self.gui.SetWindowPos.assert_any_call(22, 0, 0, 40, 959, 1040, 80)
+            bounds = {11: (959, 40, 1919, 1080), 22: (0, 40, 959, 1080)}
+            self.gui.GetWindowRect.side_effect = lambda handle: bounds[handle]
+            self.assertFalse(layout.ready())
+            self.assertTrue(layout.ready())
+
+        def test_wrong_or_maximized_bounds_never_become_ready(self):
+            layout = desktop.WindowLayout(11)
+            self.gui.GetWindowRect.return_value = (0, 0, 1919, 1080)
+            self.assertFalse(layout.ready())
+            self.assertFalse(layout.ready())
+            self.gui.GetWindowRect.return_value = layout.targets[11]
+            self.gui.IsZoomed.return_value = True
+            self.assertFalse(layout.ready())
+
+        def test_ambiguous_chrome_window_is_rejected_before_movement(self):
+            def enumerate_windows(callback, data):
+                callback(22, data)
+                callback(33, data)
+            self.gui.EnumWindows.side_effect = enumerate_windows
+            with self.assertRaises(RuntimeError):
+                desktop.WindowLayout(11, 'CatchCatch 좌표 보정')
+            self.gui.ShowWindow.assert_not_called()
+            self.gui.SetWindowPos.assert_not_called()
+
+        def test_invisible_app_does_not_move_an_unrelated_window(self):
+            self.gui.IsWindowVisible.return_value = False
+            with self.assertRaises(RuntimeError):
+                desktop.WindowLayout(11, 'CatchCatch 좌표 보정')
+            self.gui.EnumWindows.assert_not_called()
+            self.gui.SetWindowPos.assert_not_called()
+
+    class CalibrationLayoutChecks(unittest.TestCase):
+        def setUp(self):
+            self.window = MainWindow()
+            socket = Mock()
+            socket.state.return_value = workflow.QAbstractSocket.SocketState.ConnectedState
+            self.connection = SimpleNamespace(
+                socket=socket, endpoint='http://127.0.0.1:9222', _existing=False)
+            self.inspector = workflow.CursorInspector(self.window, self.connection)
+            self.inspector.control = Mock(spec=ComputerControl)
+            self.reader = Mock(spec=BrowserReader)
+            self.reader.visible_page_title.return_value = 'CatchCatch 좌표 보정'
+            self.reference = ElementPosition('button', 100, 100, 200, 80)
+            self.reader.find_clickable.return_value = self.reference
+            self.snapshot = PageSnapshot(
+                'file:///test.html', True, 0, 40, 959, 1040, 939, 940, 1.25)
+            self.reader.page_snapshot.return_value = self.snapshot
+            self.layout = Mock()
+            self.layout.ready.return_value = False
+            self.patches = [
+                patch.object(workflow, 'find_test_websocket', return_value='ws://test'),
+                patch.object(workflow, 'BrowserReader', return_value=self.reader),
+                patch.object(workflow, 'WindowLayout', return_value=self.layout),
+                patch.object(workflow.time, 'monotonic', return_value=100),
+                patch.object(workflow.QTimer, 'singleShot'),
+            ]
+            self.started = [item.start() for item in self.patches]
+            for item in self.patches:
+                self.addCleanup(item.stop)
+            self.countdown = self.started[-1]
+            self.addCleanup(self.window.close)
+            self.addCleanup(self.inspector.close)
+
+        def prepare_countdown(self):
+            self.inspector.begin_calibration()
+            self.layout.ready.return_value = True
+            self.inspector._wait_for_layout()
+            self.inspector._wait_for_layout()
+
+        def test_no_reference_query_or_countdown_until_native_layout_is_ready(self):
+            self.inspector.begin_calibration()
+            self.layout.start.assert_called_once_with()
+            self.inspector._wait_for_layout()
+            self.reader.find_clickable.assert_not_called()
+            self.countdown.assert_not_called()
+            self.inspector.control.calibrate.assert_not_called()
+            self.assertFalse(self.window.calibrate_button.isEnabled())
+
+        def test_loading_title_waits_before_window_placement(self):
+            self.reader.visible_page_title.return_value = None
+            self.inspector.begin_calibration()
+            self.started[2].assert_not_called()
+            self.countdown.assert_not_called()
+            self.reader.find_clickable.assert_not_called()
+            self.assertTrue(self.inspector.page_poll.isActive())
+            self.reader.visible_page_title.return_value = 'CatchCatch 좌표 보정'
+            self.inspector._find_test_page()
+            self.layout.start.assert_called_once_with()
+            self.assertFalse(self.inspector.page_poll.isActive())
+
+        def test_countdown_waits_for_stable_web_geometry_after_native_layout(self):
+            self.inspector.begin_calibration()
+            self.layout.ready.return_value = True
+            self.inspector._wait_for_layout()
+            self.countdown.assert_not_called()
+            resized = PageSnapshot('file:///test.html', True, 0, 40, 959, 1040, 939, 900, 1.25)
+            self.reader.page_snapshot.return_value = resized
+            self.inspector._wait_for_layout()
+            self.countdown.assert_not_called()
+            self.inspector._wait_for_layout()
+            self.countdown.assert_called_once()
+            self.assertEqual(self.countdown.call_args.args[0], 5000)
+            self.assertFalse(self.inspector.layout_poll.isActive())
+            self.inspector.control.calibrate.assert_not_called()
+
+        def test_timeout_stops_before_calibration_and_enables_retry(self):
+            self.inspector.begin_calibration()
+            self.inspector.layout_deadline = 99
+            self.inspector._wait_for_layout()
+            self.countdown.assert_not_called()
+            self.inspector.control.calibrate.assert_not_called()
+            self.assertIsNone(self.inspector.reader)
+            self.assertFalse(self.inspector.layout_poll.isActive())
+            self.assertTrue(self.window.calibrate_button.isEnabled())
+
+        def test_window_movement_during_countdown_cancels_calibration(self):
+            self.prepare_countdown()
+            self.layout.ready.return_value = False
+            self.countdown.call_args.args[1]()
+            self.inspector.control.calibrate.assert_not_called()
+            self.assertIsNone(self.inspector.calibration_geometry)
+
+        def test_changed_display_scale_during_countdown_cancels_calibration(self):
+            self.prepare_countdown()
+            self.reader.page_snapshot.return_value = PageSnapshot(
+                'file:///test.html', True, 0, 40, 959, 1040, 939, 940, 1.5)
+            self.countdown.call_args.args[1]()
+            self.inspector.control.calibrate.assert_not_called()
+            self.assertIsNone(self.inspector.calibration_geometry)
+
+        def test_stable_layout_allows_calibration_after_countdown(self):
+            self.prepare_countdown()
+            with patch.object(self.inspector, 'update_cursor'):
+                self.countdown.call_args.args[1]()
+            self.inspector.control.calibrate.assert_called_once_with(200, 140, scale=1.25)
+            self.assertEqual(self.inspector.calibration_geometry, self.snapshot.geometry)
+
+        def test_close_invalidates_pending_countdown(self):
+            self.prepare_countdown()
+            callback = self.countdown.call_args.args[1]
+            self.inspector.close()
+            callback()
+            self.inspector.control.calibrate.assert_not_called()
+            self.assertFalse(self.inspector.layout_poll.isActive())
+
+        def test_cancel_during_page_query_does_not_start_countdown(self):
+            self.inspector.begin_calibration()
+            self.layout.ready.return_value = True
+            self.reader.find_clickable.side_effect = lambda unused: self.inspector.close()
+            self.inspector._wait_for_layout()
+            self.reader.page_snapshot.assert_not_called()
+            self.countdown.assert_not_called()
+
+        def test_startup_placement_targets_only_the_gui(self):
+            with patch.object(workflow.sys, 'platform', 'win32'):
+                workflow.place_application(self.window)
+            self.started[2].assert_called_once_with(int(self.window.winId()))
+            self.layout.start.assert_called_once_with()
 
     class WorkflowChecks(unittest.TestCase):
         def setUp(self):
@@ -811,6 +1004,8 @@ def run_workflow_checks():
             self.assertEqual(captures[0]['identity']['selector'], '#play')
 
     suite = unittest.TestSuite([
+        unittest.defaultTestLoader.loadTestsFromTestCase(WindowLayoutChecks),
+        unittest.defaultTestLoader.loadTestsFromTestCase(CalibrationLayoutChecks),
         unittest.defaultTestLoader.loadTestsFromTestCase(WorkflowChecks),
         unittest.defaultTestLoader.loadTestsFromTestCase(VideoElementChecks),
     ])

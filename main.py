@@ -19,7 +19,7 @@ from PySide6.QtWidgets import QApplication
 
 from ui import MainWindow
 from browser_reader import BrowserReader, BrowserReaderError
-from computer_control import ComputerControl
+from computer_control import ComputerControl, WindowLayout
 from test_mouse_control import TestPageNotOpen, find_test_websocket
 from video_state import read_video_state
 
@@ -39,6 +39,12 @@ class CursorInspector(QObject):
         self.calibration_generation = 0
         self.page_attempts = 0
         self.calibration_geometry = None
+        self.window_layout = None
+        self.layout_deadline = 0
+        self.prepared_geometry = None
+        self.layout_poll = QTimer(self)
+        self.layout_poll.setInterval(250)
+        self.layout_poll.timeout.connect(self._wait_for_layout)
         self.page_poll = QTimer(self)
         self.page_poll.setInterval(250)
         self.page_poll.timeout.connect(self._find_test_page)
@@ -57,6 +63,7 @@ class CursorInspector(QObject):
             return
         self.window.cursor_status.setText("보정 화면을 준비하는 중입니다…")
         self.page_attempts = 0
+        self.window.calibrate_button.setEnabled(False)
         self._find_test_page()
 
     def _find_test_page(self):
@@ -66,6 +73,7 @@ class CursorInspector(QObject):
             if self.page_attempts == 0 and self.connection._existing:
                 page = Path(__file__).resolve().with_name("test.html")
                 if not page.is_file():
+                    self.close()
                     self.window.cursor_status.setText("보정 화면 test.html을 찾을 수 없습니다.")
                     return
                 try:
@@ -75,38 +83,86 @@ class CursorInspector(QObject):
                         "--new-window", page.as_uri(),
                     ])
                 except OSError as error:
+                    self.close()
                     self.window.cursor_status.setText(f"보정 화면을 열지 못했습니다: {error}")
                     return
             self.page_attempts += 1
             if self.page_attempts >= 40:
-                self.page_poll.stop()
+                self.close()
                 self.window.cursor_status.setText("보정 화면이 열리지 않았습니다. 다시 보정을 누르세요.")
             else:
                 self.page_poll.start()
             return
         except (ValueError, RuntimeError, OSError) as error:
-            self.page_poll.stop()
+            self.close()
             self.window.cursor_status.setText(f"보정 화면 탐색 실패: {error}")
             return
         self.page_poll.stop()
+        generation = self.calibration_generation
         try:
             self.reader = BrowserReader(websocket, timeout_ms=1500)
             self.reader.connect()
-            self.reference = self.reader.find_clickable("#reference")
-            if self.reference is None:
+            if generation != self.calibration_generation:
+                return
+            title = self.reader.visible_page_title()
+            if generation != self.calibration_generation:
+                return
+            if title is None:
                 self.reader.close()
                 self.reader = None
                 self.page_attempts += 1
                 if self.page_attempts >= 40:
-                    raise RuntimeError("보정 기준 버튼을 찾지 못했습니다.")
+                    raise RuntimeError("전용 Chrome의 보정 탭을 화면에 표시한 뒤 다시 보정하세요.")
                 self.page_poll.start()
                 return
+            self.window_layout = WindowLayout(int(self.window.winId()), title)
+            self.window.cursor_status.setText("Chrome은 왼쪽, CatchCatch는 오른쪽에 배치하는 중입니다…")
+            self.window_layout.start()
+            self.layout_deadline = time.monotonic() + 10
+            self.layout_poll.start()
+        except (BrowserReaderError, RuntimeError, ValueError, OSError) as error:
+            if generation != self.calibration_generation:
+                return
+            self.close()
+            self.window.cursor_status.setText(f"보정 실패: {error}")
+
+    def _wait_for_layout(self):
+        """Wait for native bounds and the resized page before starting the countdown."""
+        if self.reader is None or self.window_layout is None:
+            self.layout_poll.stop()
+            return
+        generation = self.calibration_generation
+        try:
+            if time.monotonic() >= self.layout_deadline:
+                raise RuntimeError("창 배치 또는 보정 화면 준비가 완료되지 않았습니다. 다시 보정하세요.")
+            if not self.window_layout.ready():
+                self.reference = None
+                self.prepared_geometry = None
+                return
+            reference = self.reader.find_clickable("#reference")
+            if generation != self.calibration_generation:
+                return
+            snapshot = self.reader.page_snapshot()
+            if generation != self.calibration_generation:
+                return
+            if reference is None:
+                self.reference = None
+                self.prepared_geometry = None
+                return
+            # Chrome may apply its viewport resize after the native move completes.
+            stable = reference == self.reference and snapshot.geometry == self.prepared_geometry
+            self.reference = reference
+            self.prepared_geometry = snapshot.geometry
+            if not stable:
+                return
+            self.layout_poll.stop()
             self.window.cursor_status.setText(
-                "5초 안에 Chrome 페이지를 클릭해 활성화하고 '보정 기준' 버튼 중앙에 커서를 놓으세요.")
-            self.window.calibrate_button.setEnabled(False)
-            generation = self.calibration_generation
+                "창 배치 완료. 5초 안에 Chrome 페이지를 클릭해 활성화하고 "
+                "'보정 기준' 버튼 중앙에 커서를 놓으세요.")
             QTimer.singleShot(5000, lambda: self.finish_calibration(generation))
         except (BrowserReaderError, RuntimeError, ValueError, OSError) as error:
+            if generation != self.calibration_generation:
+                return
             self.close()
             self.window.cursor_status.setText(f"보정 실패: {error}")
 
@@ -117,18 +173,31 @@ class CursorInspector(QObject):
         if self.reader is None or self.reference is None:
             return
         try:
+            if self.window_layout is None or not self.window_layout.ready():
+                raise RuntimeError("보정 대기 중 창 위치나 크기가 바뀌었습니다. 다시 보정하세요.")
             if not self.reader.page_has_focus():
                 raise RuntimeError("Chrome 페이지가 활성화되지 않았습니다.")
+            if generation != self.calibration_generation:
+                return
             fresh = self.reader.find_clickable("#reference")
+            if generation != self.calibration_generation:
+                return
             if fresh != self.reference:
                 raise RuntimeError("기준 버튼 위치가 변경되었습니다.")
-            self.control.calibrate(*fresh.center, scale=self.reader.device_pixel_ratio())
-            self.calibration_geometry = self.reader.page_snapshot().geometry
+            snapshot = self.reader.page_snapshot()
+            if generation != self.calibration_generation:
+                return
+            if snapshot.geometry != self.prepared_geometry:
+                raise RuntimeError("보정 대기 중 브라우저 크기 또는 배율이 바뀌었습니다. 다시 보정하세요.")
+            self.control.calibrate(*fresh.center, scale=snapshot.device_pixel_ratio)
+            self.calibration_geometry = snapshot.geometry
             self.window.browser_status.setText(
                 "보정 완료. 같은 Chrome 탭에서 LMS로 이동하세요. 로그인 후 버튼 위에 커서를 놓으면 이름을 표시합니다.")
             self.timer.start()
             self.update_cursor()
         except (BrowserReaderError, RuntimeError, ValueError, OSError) as error:
+            if generation != self.calibration_generation:
+                return
             self.close()
             self.window.cursor_status.setText(f"보정 실패: {error}")
 
@@ -166,11 +235,14 @@ class CursorInspector(QObject):
     def close(self):
         self.calibration_generation += 1
         self.page_poll.stop()
+        self.layout_poll.stop()
         self.timer.stop()
         self.query_failures = 0
         self.control.clear_calibration()
         self.calibration_geometry = None
         self.reference = None
+        self.window_layout = None
+        self.prepared_geometry = None
         if self.reader is not None:
             self.reader.close()
             self.reader = None
@@ -890,6 +962,17 @@ class BrowserConnection(QObject):
         # Leave Chrome open so the user can continue browsing and save sessions.
 
 
+def place_application(window):
+    """Place the GUI at startup; Chrome is placed after its test tab is identified."""
+    if sys.platform != "win32":
+        return
+    try:
+        layout = WindowLayout(int(window.winId()))
+        layout.start()
+    except (RuntimeError, ValueError, OSError) as error:
+        window.browser_status.setText(f"앱 창 배치 실패: {error}")
+
+
 def main():
     app = QApplication(sys.argv)
     window = MainWindow()
@@ -901,6 +984,7 @@ def main():
     app.aboutToQuit.connect(inspector.close)
     app.aboutToQuit.connect(connection.close)
     window.show()
+    QTimer.singleShot(0, lambda: place_application(window))
     return app.exec()
 
 

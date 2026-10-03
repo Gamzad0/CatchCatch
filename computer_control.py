@@ -28,11 +28,89 @@ and querying the target again. A returned position is a snapshot, not a handle.
 """
 
 import math
+import sys
 from typing import Optional
 
 import pyautogui
 
 from browser_reader import BrowserReader, ElementPosition
+
+
+class WindowLayout:
+    """Place identified native windows on the primary display before calibration.
+
+    Use the primary display because PyAutoGUI screen checks support that display.
+    Call ready() until the requested bounds are applied and stable; callers own
+    the timeout and must not read calibration coordinates before it succeeds.
+    """
+
+    def __init__(self, right_window, browser_title=None):
+        if sys.platform != 'win32':
+            raise RuntimeError('창 자동 배치는 Windows 환경에서 지원합니다.')
+        try:
+            import win32api
+            import win32con
+            import win32gui
+            import pywintypes
+        except ImportError as error:
+            raise RuntimeError('창 자동 배치에 필요한 pywin32를 찾을 수 없습니다.') from error
+        self.gui, self.constants, self.native_error = win32gui, win32con, pywintypes.error
+        self.previous = None
+        try:
+            if not right_window or not win32gui.IsWindowVisible(right_window):
+                raise RuntimeError('화면에 표시된 CatchCatch 앱 창을 찾지 못했습니다.')
+            monitor = win32api.MonitorFromPoint((0, 0), win32con.MONITOR_DEFAULTTOPRIMARY)
+            left, top, right, bottom = win32api.GetMonitorInfo(monitor)['Work']
+            middle = left + (right - left) // 2
+            self.targets = {right_window: (middle, top, right, bottom)}
+            if browser_title is not None:
+                if not browser_title:
+                    raise RuntimeError('보정 페이지의 창 제목을 확인하지 못했습니다.')
+                matches = []
+
+                def collect(handle, unused):
+                    if (win32gui.IsWindowVisible(handle)
+                            and win32gui.GetClassName(handle) == 'Chrome_WidgetWin_1'
+                            and win32gui.GetWindowText(handle).startswith(browser_title + ' - ')):
+                        matches.append(handle)
+
+                win32gui.EnumWindows(collect, None)
+                if len(matches) != 1:
+                    raise RuntimeError(
+                        '보정 페이지가 표시된 Chrome 창을 하나로 확인하지 못했습니다. '
+                        '전용 Chrome에서 보정 탭을 선택하고 중복 보정 창을 닫은 뒤 다시 시도하세요.')
+                if matches[0] == right_window:
+                    raise RuntimeError('앱 창과 Chrome 창이 동일합니다.')
+                self.targets[matches[0]] = (left, top, middle, bottom)
+        except self.native_error as error:
+            raise RuntimeError(f'창 탐색 실패: {error}') from error
+
+    def start(self):
+        """Restore maximized/minimized windows, then request native bounds."""
+        try:
+            for handle, (left, top, right, bottom) in self.targets.items():
+                self.gui.ShowWindow(handle, self.constants.SW_RESTORE)
+                self.gui.SetWindowPos(
+                    handle, self.constants.HWND_TOP, left, top, right - left, bottom - top,
+                    self.constants.SWP_NOACTIVATE | self.constants.SWP_SHOWWINDOW)
+        except self.native_error as error:
+            raise RuntimeError(f'창 배치 실패: {error}') from error
+
+    def ready(self):
+        """Require two consecutive matching native window-bound observations."""
+        try:
+            actual = {}
+            for handle in self.targets:
+                if (not self.gui.IsWindow(handle) or not self.gui.IsWindowVisible(handle)
+                        or self.gui.IsIconic(handle) or self.gui.IsZoomed(handle)):
+                    self.previous = None
+                    return False
+                actual[handle] = self.gui.GetWindowRect(handle)
+            stable = actual == self.targets and actual == self.previous
+            self.previous = actual
+            return stable
+        except self.native_error as error:
+            raise RuntimeError(f'창 배치 확인 실패: {error}') from error
 
 
 class ComputerControl:
